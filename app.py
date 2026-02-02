@@ -273,6 +273,22 @@ def load_any(file) -> pd.DataFrame:
 
 
 df0 = load_any(uploaded)
+def fix_mojibake_columns(df: pd.DataFrame) -> pd.DataFrame:
+    # Ha ilyen "DĂˇtum", "TevĂ©kenysĂ©g..." jellegű oszlopok vannak,
+    # akkor valószínű latin1->utf8 félreértelmezés történt.
+    if any("Ă" in c for c in df.columns.astype(str)):
+        new_cols = []
+        for c in df.columns.astype(str):
+            try:
+                new_cols.append(c.encode("latin1").decode("utf-8"))
+            except Exception:
+                new_cols.append(c)
+        df = df.copy()
+        df.columns = new_cols
+    return df
+
+df0 = fix_mojibake_columns(df0)
+
 df = df0.copy()
 
 # =========================================================
@@ -282,14 +298,37 @@ df = df0.copy()
 df = df0.copy()
 
 # --- Dátum oszlop felderítés + parse (CSV-hez is)
-date_candidates = [c for c in df.columns if "dátum" in c.lower() or "datum" in c.lower()]
+date_candidates = [
+    c for c in df.columns
+    if "dátum" in c.lower() or "datum" in c.lower() or "date" in c.lower()
+]
+
 if date_candidates:
     date_col = date_candidates[0]
-    s = df[date_col].astype(str).str.strip().replace({"--": np.nan, "": np.nan, "None": np.nan})
-    dt = pd.to_datetime(s, errors="coerce", dayfirst=True)
+
+    s = (
+        df[date_col]
+        .astype(str)
+        .str.strip()
+        .replace({"--": np.nan, "": np.nan, "None": np.nan})
+    )
+
+    # 1️⃣ első próbálkozás: fix ISO formátum (CSV-dhez ez a jó)
+    dt = pd.to_datetime(
+        s,
+        errors="coerce",
+        format="%Y-%m-%d %H:%M:%S"
+    )
+
+    # 2️⃣ fallback: ha mégis eltérő formátum lenne
+    if dt.notna().sum() == 0:
+        dt = pd.to_datetime(s, errors="coerce")
+
     df["Dátum"] = dt
+
 else:
     df["Dátum"] = pd.NaT
+
 
 
 
