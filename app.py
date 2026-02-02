@@ -8,6 +8,68 @@ import os
 from datetime import datetime
 
 st.set_page_config(page_title="Garmin Futás Dashboard", layout="wide")
+# =========================================================
+# 📱 MOBIL NÉZET (kapcsoló + UI finomhangolás)
+# =========================================================
+st.sidebar.divider()
+st.sidebar.header("Megjelenés")
+MOBILE = st.sidebar.toggle("📱 Mobil nézet", value=True)
+
+def inject_mobile_css(mobile: bool):
+    if not mobile:
+        return
+    st.markdown(
+        """
+        <style>
+        /* kisebb margók mobilon */
+        .block-container { padding-top: 0.8rem; padding-bottom: 1.2rem; padding-left: 0.8rem; padding-right: 0.8rem; }
+
+        /* sidebar kicsit kompaktabb */
+        section[data-testid="stSidebar"] .block-container { padding-top: 0.8rem; }
+
+        /* metric kártyák kompaktabbak */
+        div[data-testid="stMetric"] {
+            padding: 0.6rem 0.8rem;
+            border-radius: 12px;
+        }
+        div[data-testid="stMetric"] label { font-size: 0.85rem !important; }
+        div[data-testid="stMetric"] div { font-size: 1.4rem !important; }
+
+        /* dataframe ne legyen óriás */
+        div[data-testid="stDataFrame"] { border-radius: 12px; overflow: hidden; }
+
+        /* fejlécek kicsit kisebbek */
+        h1 { font-size: 1.6rem !important; }
+        h2 { font-size: 1.2rem !important; }
+        h3 { font-size: 1.05rem !important; }
+
+        </style>
+        """,
+        unsafe_allow_html=True
+    )
+
+inject_mobile_css(MOBILE)
+
+def metric_row(mobile: bool, items):
+    """
+    items: list of tuples (label, value, delta_optional)
+    """
+    if mobile:
+        cols = st.columns(2)
+        for i, it in enumerate(items):
+            label = it[0]
+            value = it[1]
+            delta = it[2] if len(it) > 2 else None
+            with cols[i % 2]:
+                st.metric(label, value, delta=delta)
+    else:
+        cols = st.columns(len(items))
+        for col, it in zip(cols, items):
+            label = it[0]
+            value = it[1]
+            delta = it[2] if len(it) > 2 else None
+            col.metric(label, value, delta=delta)
+
 
 # =========================================================
 # 0) AUTH (jelszavas)
@@ -512,24 +574,49 @@ if len(fat) >= 20:
 # =========================================================
 st.title("🏃 Garmin Futás Dashboard")
 
-if "Technika_index" not in df.columns:
-    st.error("Nem találom a Technika_index-et.")
+# -------------------------
+# Segédek (biztos, hogy vannak)
+# -------------------------
+def num(v):
+    return pd.to_numeric(
+        pd.Series([v]).astype(str).str.replace(",", ".", regex=False),
+        errors="coerce"
+    ).iloc[0]
+
+def med(series):
+    return pd.to_numeric(
+        series.astype(str).str.replace(",", ".", regex=False),
+        errors="coerce"
+    ).median()
+
+# -------------------------
+# TABOK: Mobil / Desktop
+# -------------------------
+# Mobilon tabok, desktopon is ugyanaz (egységes UX)
+tab_overview, tab_last, tab_warn, tab_ready, tab_data = st.tabs(
+    ["📌 Áttekintés", "🔎 Utolsó futás", "🚦 Warning", "🏁 Readiness", "📄 Adatok"]
+)
+
+# -------------------------
+# Minimális adat: csak érvényes dátum kell a nézethez
+# -------------------------
+if "Dátum" not in df.columns:
+    st.error("Nem találom a 'Dátum' oszlopot.")
     st.stop()
 
-# A dashboard nézethez elég a dátum, ne dobjuk ki az összes sort csak azért,
-# mert Technika_index esetleg még nem számolható CSV-ből
 d = df[df["Dátum"].notna()].copy()
 if d.empty:
     st.error("Nincs érvényes dátummal rendelkező sor (Dátum parse -> NaT).")
     st.stop()
-
 
 run_type_col = safe_col(d, "Run_type")
 fatigue_col = safe_col(d, "Fatigue_score")
 fatigue_type_col = safe_col(d, "Fatigue_type")
 slope_col = safe_col(d, "slope_bucket")
 
-# ---- Sidebar: szűrők + baseline
+# -------------------------
+# Sidebar: Szűrők + Baseline
+# -------------------------
 st.sidebar.divider()
 st.sidebar.header("Szűrők")
 
@@ -563,7 +650,9 @@ if slope_col:
 if fatigue_col and d[fatigue_col].notna().sum() > 0:
     fmin = float(np.nanmin(d[fatigue_col]))
     fmax = float(np.nanmax(d[fatigue_col]))
-    sel_fmin, sel_fmax = st.sidebar.slider("Fatigue_score", min_value=fmin, max_value=fmax, value=(fmin, fmax))
+    sel_fmin, sel_fmax = st.sidebar.slider(
+        "Fatigue_score", min_value=fmin, max_value=fmax, value=(fmin, fmax)
+    )
     mask &= d[fatigue_col].between(sel_fmin, sel_fmax)
 
 st.sidebar.divider()
@@ -573,7 +662,6 @@ baseline_weeks = st.sidebar.slider(
     "Baseline ablak (hetek)", min_value=4, max_value=52, value=12, step=1,
     help="Ennyi hét easy futásai alapján számoljuk a baseline mediánt."
 )
-
 baseline_min_runs = st.sidebar.slider(
     "Minimum baseline futás", min_value=10, max_value=80, value=25, step=5,
     help="Ha az ablakban nincs elég easy futás, fallback: legutóbbi N easy futás."
@@ -581,72 +669,72 @@ baseline_min_runs = st.sidebar.slider(
 
 view = d.loc[mask].copy().sort_values("Dátum")
 
-st.subheader("🗓️ Napi összkép (coach)")
-status, msg = daily_coach_summary(
-        base_all=d,
-        run_type_col=run_type_col,
-        fatigue_col=fatigue_col,
-        baseline_weeks=baseline_weeks,
-        baseline_min_runs=baseline_min_runs
-    )
+# -------------------------
+# ÁTTEKINTÉS: KPI + grafikonok
+# -------------------------
+with tab_overview:
+    st.subheader("🗓️ Napi összkép (coach)")
 
-if status == "🔴":
-        st.error(f"{status} {msg}")
-elif status == "🟠":
-        st.warning(f"{status} {msg}")
-else:
-        st.success(f"{status} {msg}")
+    # daily_coach_summary opcionális – ha nincs definiálva, ne dőljön össze
+    if "daily_coach_summary" in globals():
+        status, msg = daily_coach_summary(
+            base_all=d,
+            run_type_col=run_type_col,
+            fatigue_col=fatigue_col,
+            baseline_weeks=baseline_weeks,
+            baseline_min_runs=baseline_min_runs
+        )
+        if status == "🔴":
+            st.error(f"{status} {msg}")
+        elif status == "🟠":
+            st.warning(f"{status} {msg}")
+        else:
+            st.success(f"{status} {msg}")
+    else:
+        st.info("ℹ️ (Opció) daily_coach_summary nincs bekötve – csak a grafikonok/KPI futnak.")
 
-st.divider()
+    st.divider()
 
+    # KPI-k (ha nincs technika/fatigue, akkor is menjen)
+    tech_avg = view["Technika_index"].mean() if ("Technika_index" in view.columns and view["Technika_index"].notna().any()) else np.nan
+    fat_avg = view[fatigue_col].mean() if (fatigue_col and view[fatigue_col].notna().any()) else np.nan
+    most_type = view[run_type_col].value_counts().index[0] if (run_type_col and len(view) > 0) else "—"
 
-# ---- KPI row (gyors összkép)
-c1, c2, c3, c4 = st.columns(4)
-c1.metric("Futások (szűrve)", f"{len(view)}")
-c2.metric("Átlag Technika_index", f"{view['Technika_index'].mean():.1f}" if len(view) else "—")
-c3.metric("Átlag Fatigue_score", f"{view[fatigue_col].mean():.1f}" if (fatigue_col and len(view.dropna(subset=[fatigue_col])) > 0) else "—")
-c4.metric("Leggyakoribb típus", view[run_type_col].value_counts().index[0] if (run_type_col and len(view) > 0) else "—")
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Futások (szűrve)", f"{len(view)}")
+    c2.metric("Átlag Technika_index", f"{tech_avg:.1f}" if pd.notna(tech_avg) else "—")
+    c3.metric("Átlag Fatigue_score", f"{fat_avg:.1f}" if pd.notna(fat_avg) else "—")
+    c4.metric("Leggyakoribb típus", most_type)
 
-st.divider()
+    st.divider()
 
-# ---- Tabs: kevesebb túlterhelés egy oldalon
-tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
-    "🧠 Összkép",
-    "🔎 Utolsó futás",
-    "🚦 Warning",
-    "🧱 Blokkok",
-    "🏁 Readiness",
-    "📋 Haladó adatok"
-])
-
-# =========================================================
-# TAB 1: Összkép
-# =========================================================
-    
-with tab1:
+    # Technika idősor csak ha van Technika_index
     left, right = st.columns([1.4, 1])
 
     with left:
-        st.subheader("Technika_index időben")
-        fig = px.scatter(
-            view,
-            x="Dátum",
-            y="Technika_index",
-            color=run_type_col if run_type_col else None,
-            symbol=slope_col if slope_col else None,
-            hover_data=[c for c in ["Cím", "Átlagos tempó", fatigue_col, fatigue_type_col, slope_col] if c and c in view.columns],
-            opacity=0.75,
-        )
-        view2 = view[["Dátum", "Technika_index"]].dropna().sort_values("Dátum").copy()
-        if len(view2) >= 10:
-            view2["roll30"] = view2["Technika_index"].rolling(window=30, min_periods=10).mean()
-            fig_line = px.line(view2, x="Dátum", y="roll30")
-            for tr in fig_line.data:
-                fig.add_trace(tr)
-        st.plotly_chart(fig, use_container_width=True)
+        st.subheader("📈 Technika_index időben")
+        if "Technika_index" in view.columns and view["Technika_index"].notna().sum() >= 3:
+            fig = px.scatter(
+                view.dropna(subset=["Technika_index"]),
+                x="Dátum",
+                y="Technika_index",
+                color=run_type_col if run_type_col else None,
+                symbol=slope_col if slope_col else None,
+                hover_data=[c for c in ["Cím", "Átlagos tempó", fatigue_col, fatigue_type_col, slope_col] if c and c in view.columns],
+                opacity=0.75,
+            )
+            view2 = view[["Dátum", "Technika_index"]].dropna().sort_values("Dátum").copy()
+            if len(view2) >= 10:
+                view2["roll30"] = view2["Technika_index"].rolling(window=30, min_periods=10).mean()
+                fig_line = px.line(view2, x="Dátum", y="roll30")
+                for tr in fig_line.data:
+                    fig.add_trace(tr)
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.info("Nincs elég Technika_index adat az idősorhoz.")
 
     with right:
-        st.subheader("Terep megoszlás (szűrve)")
+        st.subheader("🗺️ Terep megoszlás (szűrve)")
         if slope_col and len(view[slope_col].dropna()) > 0:
             cnt = view[slope_col].value_counts().reset_index()
             cnt.columns = ["slope_bucket", "db"]
@@ -658,8 +746,9 @@ with tab1:
 
     cA, cB = st.columns(2)
     with cA:
-        st.subheader("Technika vs Fáradás (kvadráns)")
-        if fatigue_col and view.dropna(subset=[fatigue_col]).shape[0] >= 20:
+        st.subheader("🧭 Technika vs Fáradás (kvadráns)")
+        if ("Technika_index" in view.columns and fatigue_col and
+            view["Technika_index"].notna().sum() >= 10 and view[fatigue_col].notna().sum() >= 10):
             dd = view.dropna(subset=["Technika_index", fatigue_col]).copy()
             tech_med = float(np.nanmedian(dd["Technika_index"]))
             fat_med = float(np.nanmedian(dd[fatigue_col]))
@@ -678,412 +767,247 @@ with tab1:
             st.plotly_chart(fig2, use_container_width=True)
             st.caption(f"Medián határok: Technika {tech_med:.1f}, Fatigue {fat_med:.1f}")
         else:
-            st.info("Kevés Fatigue adat (legalább ~20 pont kell).")
+            st.info("Kevés Technika/Fatigue adat a kvadránshoz.")
 
     with cB:
-        st.subheader("Top / Bottom futások (gyors lista)")
-        topn = st.slider("N", 5, 30, 10, key="topn_overview")
-        if len(view):
-            cols = ["Dátum"]
-            if run_type_col: cols.append(run_type_col)
-            if slope_col: cols.append(slope_col)
-            cols += ["Technika_index"]
-            if fatigue_col: cols.append(fatigue_col)
-            if "Cím" in view.columns: cols.append("Cím")
+        st.subheader("🏅 Top / Bottom futások")
+        with st.expander("Megnyitás", expanded=False):
+            topn = st.slider("N", 5, 30, 10, key="topn_overview")
+            if "Technika_index" in view.columns and view["Technika_index"].notna().any():
+                cols = ["Dátum"]
+                if run_type_col: cols.append(run_type_col)
+                if slope_col: cols.append(slope_col)
+                cols += ["Technika_index"]
+                if fatigue_col: cols.append(fatigue_col)
+                if "Cím" in view.columns: cols.append("Cím")
 
-            top = view.sort_values("Technika_index", ascending=False).head(topn)
-            bot = view.sort_values("Technika_index", ascending=True).head(topn)
+                top = view.sort_values("Technika_index", ascending=False).head(topn)
+                bot = view.sort_values("Technika_index", ascending=True).head(topn)
 
-            st.markdown("**⬆️ Top technika**")
-            st.dataframe(top[cols], use_container_width=True, hide_index=True)
+                st.markdown("**⬆️ Top technika**")
+                st.dataframe(top[cols], use_container_width=True, hide_index=True, height=260)
+                st.markdown("**⬇️ Bottom technika**")
+                st.dataframe(bot[cols], use_container_width=True, hide_index=True, height=260)
+            else:
+                st.info("Nincs Technika_index a top/bottom listához.")
 
-            st.markdown("**⬇️ Bottom technika**")
-            st.dataframe(bot[cols], use_container_width=True, hide_index=True)
-        else:
-            st.info("Nincs adat a szűrők mellett.")
-
-# =========================================================
-# TAB 2: Utolsó futás (vizuális baseline összehasonlítás)
-# =========================================================
-with tab2:
+# -------------------------
+# UTOLSÓ FUTÁS: vizuális baseline összevetés + jelzések
+# -------------------------
+with tab_last:
     st.subheader("🔎 Utolsó futás elemzése (kevesebb táblázat, több jelzés)")
 
-    base = d.copy().dropna(subset=["Dátum", "Technika_index"]).sort_values("Dátum")
-    if len(base) == 0:
-        st.info("Nincs elég adat.")
+    if "Technika_index" not in d.columns:
+        st.info("Nincs Technika_index – az utolsó futás technika elemzéséhez számított index kell.")
     else:
-        options = base.tail(60).copy()
+        base = d.dropna(subset=["Dátum", "Technika_index"]).sort_values("Dátum")
+        if len(base) == 0:
+            st.info("Nincs elég adat (Dátum + Technika_index).")
+        else:
+            options = base.tail(60).copy()
 
-        def label_row(r):
-            title = r["Cím"] if "Cím" in options.columns and pd.notna(r.get("Cím")) else ""
-            rt = r["Run_type"] if "Run_type" in options.columns and pd.notna(r.get("Run_type")) else ""
-            return f"{r['Dátum'].strftime('%Y-%m-%d %H:%M')} | {rt} | {title}"[:120]
+            def label_row(r):
+                title = r["Cím"] if "Cím" in options.columns and pd.notna(r.get("Cím")) else ""
+                rt = r["Run_type"] if "Run_type" in options.columns and pd.notna(r.get("Run_type")) else ""
+                return f"{r['Dátum'].strftime('%Y-%m-%d %H:%M')} | {rt} | {title}"[:120]
 
-        options["__label"] = options.apply(label_row, axis=1)
-        chosen_label = st.selectbox("Futás kiválasztása", options["__label"].tolist(), index=len(options)-1, key="pick_last")
-        last = options.loc[options["__label"] == chosen_label].iloc[0]
+            options["__label"] = options.apply(label_row, axis=1)
+            chosen_label = st.selectbox("Futás kiválasztása", options["__label"].tolist(), index=len(options)-1, key="pick_last")
+            last = options.loc[options["__label"] == chosen_label].iloc[0]
 
-        # Baseline-ek
-        last30 = base.tail(30)
-        baseline_full = get_easy_baseline(base_df=base, last_date=last["Dátum"], weeks=baseline_weeks, min_runs=baseline_min_runs)
-        easy10 = baseline_full.tail(10).copy() if len(baseline_full) else pd.DataFrame()
-
-        # KPI-k
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Technika_index", f"{float(last['Technika_index']):.1f}")
-        c2.metric("Fatigue_score", f"{float(last.get('Fatigue_score')):.1f}" if pd.notna(last.get("Fatigue_score")) else "—")
-        c3.metric("Run_type", str(last.get("Run_type")) if pd.notna(last.get("Run_type")) else "—")
-        pace = last.get("Átlagos tempó") if "Átlagos tempó" in base.columns else None
-        dist = last.get("Távolság") if "Távolság" in base.columns else None
-        c4.metric("Tempó / Táv", f"{pace} / {dist} km" if (pd.notna(pace) or pd.notna(dist)) else "—")
-
-        if "Cím" in base.columns and pd.notna(last.get("Cím")):
-            st.caption(f"**Cím:** {last['Cím']}")
-
-        st.caption(f"Baseline easy futások száma: {len(baseline_full)} (hetek: {baseline_weeks})")
-
-        # ---- VIZUÁLIS összehasonlítás (eltérés %)
-        compare_cols = [
-            ("Átl. pedálütem", "Cadence (spm)", "higher_better_stability"),  # stabilitás, nem simán "minél több"
-            ("Átlagos lépéshossz", "Lépéshossz (m)", "higher_better"),
-            ("Átlagos függőleges arány", "Vertical Ratio (%)", "lower_better"),
-            ("Átlagos függőleges oszcilláció", "Vertical Osc (cm)", "lower_better"),
-            ("Átlagos talajérintési idő", "GCT (ms)", "lower_better"),
-            ("Átlagos pulzusszám", "Átlag pulzus", "context"),
-            ("Max. pulzus", "Max pulzus", "context"),
-        ]
-
-        rows = []
-        for col, label, rule in compare_cols:
-            if col not in base.columns or len(baseline_full) == 0:
-                continue
-
-            v = num(last.get(col))
-            b = med(baseline_full[col])
-
-            if pd.isna(v) or pd.isna(b) or b == 0:
-                continue
-
-            delta_pct = (v - b) / b * 100.0
-
-            # "jó irány" jelölés
-            if rule == "lower_better":
-                score = -delta_pct
-            elif rule == "higher_better":
-                score = delta_pct
-            else:
-                score = 0.0  # kontext, nem pontozzuk
-
-            rows.append([label, float(v), float(b), float(delta_pct), float(score), rule])
-
-        if rows:
-            comp = pd.DataFrame(rows, columns=["Mutató", "Utolsó", "Baseline", "Eltérés_%", "Jó_irány_score", "rule"])
-
-            st.markdown("### 📈 Eltérések az easy baseline-hoz képest")
-            # Score szerint színezzük: pozitív = javulás, negatív = romlás (a 'lower_better' már fordítva)
-            figd = px.bar(
-                comp.sort_values("Jó_irány_score"),
-                x="Jó_irány_score",
-                y="Mutató",
-                orientation="h",
-                hover_data=["Utolsó", "Baseline", "Eltérés_%", "rule"]
+            baseline_full = get_easy_baseline(
+                base_df=base,
+                last_date=last["Dátum"],
+                weeks=baseline_weeks,
+                min_runs=baseline_min_runs
             )
-            st.plotly_chart(figd, use_container_width=True)
 
-            # Coach jelzések
-            st.markdown("### 🚩 Gyors jelzések")
-            msgs = []
-            for _, r in comp.iterrows():
-                if r["rule"] not in ("lower_better", "higher_better_stability", "higher_better"):
-                    continue
-                # küszöbök
-                if r["rule"] == "higher_better_stability":
-                    # cadence-nél a nagyobb nem automatikusan "jobb", ezért csak eltérés alapú jelzés
-                    if abs(r["Eltérés_%"]) > 5:
-                        msgs.append(f"🟠 **{r['Mutató']}** eltér a baseline-tól (>{abs(r['Eltérés_%']):.1f}%).")
-                else:
-                    if r["Jó_irány_score"] < -5:
-                        msgs.append(f"🔴 **{r['Mutató']}** romlott (≈ {r['Eltérés_%']:+.1f}%).")
-                    elif r["Jó_irány_score"] < -2:
-                        msgs.append(f"🟠 **{r['Mutató']}** kicsit romlott (≈ {r['Eltérés_%']:+.1f}%).")
-                    else:
-                        msgs.append(f"🟢 **{r['Mutató']}** rendben (≈ {r['Eltérés_%']:+.1f}%).")
+            # KPI-k
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Technika_index", f"{float(last['Technika_index']):.1f}")
+            c2.metric("Fatigue_score", f"{float(last.get('Fatigue_score')):.1f}" if pd.notna(last.get("Fatigue_score")) else "—")
+            c3.metric("Run_type", str(last.get("Run_type")) if pd.notna(last.get("Run_type")) else "—")
+            pace = last.get("Átlagos tempó") if "Átlagos tempó" in base.columns else None
+            dist = last.get("Távolság") if "Távolság" in base.columns else None
+            c4.metric("Tempó / Táv", f"{pace} / {dist} km" if (pd.notna(pace) or pd.notna(dist)) else "—")
 
-            for m in msgs[:8]:
-                st.write(m)
+            if "Cím" in base.columns and pd.notna(last.get("Cím")):
+                st.caption(f"**Cím:** {last['Cím']}")
 
-            # Részletes táblázat csak expanderben
-            with st.expander("📋 Részletes összevetés táblázatban"):
-                st.dataframe(comp.drop(columns=["Jó_irány_score"]), use_container_width=True, hide_index=True)
-        else:
-            st.info("Nincs elég adat vizuális baseline-összevetéshez.")
+            st.caption(f"Baseline easy futások száma: {len(baseline_full)} (hetek: {baseline_weeks})")
 
-        # ---- Komponens hozzájárulás (impact chart)
-        st.markdown("### 🧩 Technika-index komponens hatás (baseline-hoz képest)")
-        if len(baseline_full) >= 10:
-            weights = {"GCT": 0.30, "VR": 0.25, "VO": 0.15, "Cadence": 0.20, "Stride": 0.10}
-            comps = []
-
-            # GCT (kisebb jobb)
-            if "Átlagos talajérintési idő" in base.columns:
-                v = num(last.get("Átlagos talajérintési idő"))
-                b = med(baseline_full["Átlagos talajérintési idő"])
-                if pd.notna(v) and pd.notna(b) and b != 0:
-                    delta = (v - b) / b
-                    comps.append(("Talajérintési idő (GCT)", float(-delta * weights["GCT"] * 100)))
-
-            # VR (kisebb jobb)
-            if "Átlagos függőleges arány" in base.columns:
-                v = num(last.get("Átlagos függőleges arány"))
-                b = med(baseline_full["Átlagos függőleges arány"])
-                if pd.notna(v) and pd.notna(b) and b != 0:
-                    delta = (v - b) / b
-                    comps.append(("Függőleges arány (VR)", float(-delta * weights["VR"] * 100)))
-
-            # VO (kisebb jobb)
-            if "Átlagos függőleges oszcilláció" in base.columns:
-                v = num(last.get("Átlagos függőleges oszcilláció"))
-                b = med(baseline_full["Átlagos függőleges oszcilláció"])
-                if pd.notna(v) and pd.notna(b) and b != 0:
-                    delta = (v - b) / b
-                    comps.append(("Függőleges oszcilláció (VO)", float(-delta * weights["VO"] * 100)))
-
-            # Cadence (stabilitás: abs eltérés)
-            if "Átl. pedálütem" in base.columns:
-                v = num(last.get("Átl. pedálütem"))
-                b = med(baseline_full["Átl. pedálütem"])
-                if pd.notna(v) and pd.notna(b) and b != 0:
-                    delta = abs(v - b) / b
-                    comps.append(("Cadence stabilitás", float(-delta * weights["Cadence"] * 100)))
-
-            # Stride (nagyobb jobb)
-            if "Átlagos lépéshossz" in base.columns:
-                v = num(last.get("Átlagos lépéshossz"))
-                b = med(baseline_full["Átlagos lépéshossz"])
-                if pd.notna(v) and pd.notna(b) and b != 0:
-                    delta = (v - b) / b
-                    comps.append(("Lépéshossz", float(delta * weights["Stride"] * 100)))
-
-            if comps:
-                comp_df = pd.DataFrame(comps, columns=["Komponens", "Hatás (pont)"]).sort_values("Hatás (pont)")
-                figc = px.bar(comp_df, x="Hatás (pont)", y="Komponens", orientation="h")
-                st.plotly_chart(figc, use_container_width=True)
-
-                worst = comp_df.iloc[0]
-                best = comp_df.iloc[-1]
-
-                # 3 soros összegzés
-                st.markdown("### 🧠 Gyors összegzés (3 sor)")
-                lines = []
-
-                # stabilitás (VR/VO/GCT)
-                stable = 0
-                for col in ["Átlagos függőleges arány", "Átlagos függőleges oszcilláció", "Átlagos talajérintési idő"]:
-                    if col in base.columns and len(easy10) >= 5:
-                        v = num(last.get(col))
-                        b = med(easy10[col])
-                        if pd.notna(v) and pd.notna(b) and b != 0 and abs(v - b) / b <= 0.05:
-                            stable += 1
-
-                if stable >= 2:
-                    lines.append("• A **mozgásminták többnyire stabilak** (VR/VO/GCT a baseline körül).")
-                else:
-                    lines.append("• A **mozgásminták részben romlottak**, ez technikai fáradásra utalhat.")
-
-                if worst["Hatás (pont)"] < 0:
-                    lines.append(f"• A technikát leginkább a **{worst['Komponens']}** húzta le.")
-                else:
-                    lines.append(f"• A technikát leginkább a **{best['Komponens']}** segítette.")
-
-                f = last.get("Fatigue_score")
-                if pd.notna(f):
-                    if f >= 60:
-                        lines.append("• **Magas fáradás** → regeneráció + rövidebb easy futások, technika-fókusz.")
-                    elif f >= 45:
-                        lines.append("• **Mérsékelt fáradás** → terhelést ne emeld, tartsd kontroll alatt.")
-                    else:
-                        lines.append("• **Alacsony fáradás** → technikailag jó nap, kontrollált terhelés belefér.")
-
-                for l in lines:
-                    st.write(l)
-
+            if len(baseline_full) < 8:
+                st.info("Kevés baseline easy futás – az összevetés bizonytalan. (Ajánlott ≥ 8–10)")
             else:
-                st.info("Nincs elég adat a komponens-hatáshoz.")
-        else:
-            st.info("Kevés baseline easy futás a komponens-elemzéshez (legalább ~10).")
+                compare_cols = [
+                    ("Átl. pedálütem", "Cadence (spm)", "cadence_stability"),
+                    ("Átlagos lépéshossz", "Lépéshossz (m)", "higher_better"),
+                    ("Átlagos függőleges arány", "Vertical Ratio (%)", "lower_better"),
+                    ("Átlagos függőleges oszcilláció", "Vertical Osc (cm)", "lower_better"),
+                    ("Átlagos talajérintési idő", "GCT (ms)", "lower_better"),
+                    ("Átlagos pulzusszám", "Átlag pulzus", "context"),
+                    ("Max. pulzus", "Max pulzus", "context"),
+                ]
 
-# =========================================================
-# TAB 3: Warning (könnyebb, kevesebb táblázat)
-# =========================================================
-with tab3:
+                rows = []
+                for col, label, rule in compare_cols:
+                    if col not in base.columns:
+                        continue
+                    v = num(last.get(col))
+                    b = med(baseline_full[col])
+                    if pd.isna(v) or pd.isna(b) or b == 0:
+                        continue
+
+                    delta_pct = (v - b) / b * 100.0
+
+                    if rule == "lower_better":
+                        good = -delta_pct
+                    elif rule == "higher_better":
+                        good = delta_pct
+                    elif rule == "cadence_stability":
+                        good = -abs(delta_pct)
+                    else:
+                        good = 0.0
+
+                    rows.append([label, float(v), float(b), float(delta_pct), float(good), rule])
+
+                if rows:
+                    comp = pd.DataFrame(rows, columns=["Mutató", "Utolsó", "Baseline", "Eltérés_%", "Jó_irány", "rule"])
+
+                    st.markdown("### 📈 Eltérések az easy baseline-hoz képest")
+                    figd = px.bar(
+                        comp.sort_values("Jó_irány"),
+                        x="Jó_irány",
+                        y="Mutató",
+                        orientation="h",
+                        hover_data=["Utolsó", "Baseline", "Eltérés_%", "rule"]
+                    )
+                    st.plotly_chart(figd, use_container_width=True)
+
+                    st.markdown("### 🚩 Gyors jelzések")
+                    msgs = []
+                    for _, r in comp.iterrows():
+                        if r["rule"] in ("lower_better", "higher_better"):
+                            if r["Jó_irány"] < -5:
+                                msgs.append(f"🔴 **{r['Mutató']}** romlott (≈ {r['Eltérés_%']:+.1f}%).")
+                            elif r["Jó_irány"] < -2:
+                                msgs.append(f"🟠 **{r['Mutató']}** kicsit romlott (≈ {r['Eltérés_%']:+.1f}%).")
+                            else:
+                                msgs.append(f"🟢 **{r['Mutató']}** rendben (≈ {r['Eltérés_%']:+.1f}%).")
+                        elif r["rule"] == "cadence_stability":
+                            if abs(r["Eltérés_%"]) > 5:
+                                msgs.append(f"🟠 **{r['Mutató']}** eltér a baseline-tól (≈ {r['Eltérés_%']:+.1f}%).")
+                            else:
+                                msgs.append(f"🟢 **{r['Mutató']}** stabil (≈ {r['Eltérés_%']:+.1f}%).")
+
+                    for m in msgs[:10]:
+                        st.write(m)
+
+                    with st.expander("📋 Részletes táblázat"):
+                        st.dataframe(comp.drop(columns=["Jó_irány"]), use_container_width=True, hide_index=True)
+                else:
+                    st.info("Nincs elég összehasonlítható metrika az utolsó futáshoz.")
+
+# -------------------------
+# WARNING TAB
+# -------------------------
+with tab_warn:
     st.subheader("🚦 Warning rendszer (easy futások alapján)")
 
-    with st.expander("Beállítások", expanded=False):
-        colA, colB, colC = st.columns(3)
-        tech_red = colA.slider("Tech küszöb (PIROS)", 0, 100, 35, key="wr_tech_red")
-        tech_yellow = colA.slider("Tech küszöb (SÁRGA)", 0, 100, 40, key="wr_tech_yellow")
-
-        fat_yellow = colB.slider("Fatigue küszöb (SÁRGA)", 0, 100, 60, key="wr_fat_yellow")
-        fat_red = colB.slider("Fatigue küszöb (PIROS)", 0, 100, 55, key="wr_fat_red")
-
-        n_red = colC.slider("N easy futás (PIROS ablak)", 3, 12, 3, key="wr_n_red")
-        need_red = colC.slider("Minimum találat (PIROS)", 1, 12, 2, key="wr_need_red")
-
-        n_yellow = colC.slider("N easy futás (SÁRGA ablak)", 3, 20, 5, key="wr_n_yellow")
-        need_yellow = colC.slider("Minimum találat (SÁRGA)", 1, 20, 2, key="wr_need_yellow")
-
-    base_all = d.copy()
-    if run_type_col:
-        easy = base_all[base_all[run_type_col] == "easy"].copy()
+    if "Technika_index" not in d.columns or fatigue_col is None:
+        st.info("Warning-hoz kell Technika_index és Fatigue_score.")
     else:
-        easy = base_all.copy()
+        with st.expander("Beállítások", expanded=False):
+            colA, colB, colC = st.columns(3)
+            tech_red = colA.slider("Tech küszöb (PIROS)", 0, 100, 35, key="wr_tech_red")
+            tech_yellow = colA.slider("Tech küszöb (SÁRGA)", 0, 100, 40, key="wr_tech_yellow")
 
-    easy = easy.dropna(subset=["Technika_index"]).sort_values("Dátum")
+            fat_yellow = colB.slider("Fatigue küszöb (SÁRGA)", 0, 100, 60, key="wr_fat_yellow")
+            fat_red = colB.slider("Fatigue küszöb (PIROS)", 0, 100, 55, key="wr_fat_red")
 
-    # baseline-window szűkítés (ne a teljes múlt)
-    if len(easy) > 0:
-        last_day = easy["Dátum"].max()
-        start = last_day - pd.Timedelta(weeks=baseline_weeks)
-        easy = easy[easy["Dátum"] >= start].copy()
-        if len(easy) < baseline_min_runs:
-            easy = easy.tail(baseline_min_runs).copy()
+            n_red = colC.slider("N easy futás (PIROS ablak)", 3, 12, 3, key="wr_n_red")
+            need_red = colC.slider("Minimum találat (PIROS)", 1, 12, 2, key="wr_need_red")
 
-    if fatigue_col:
+            n_yellow = colC.slider("N easy futás (SÁRGA ablak)", 3, 20, 5, key="wr_n_yellow")
+            need_yellow = colC.slider("Minimum találat (SÁRGA)", 1, 20, 2, key="wr_need_yellow")
+
+        base_all = d.dropna(subset=["Dátum", "Technika_index"]).sort_values("Dátum")
+        if run_type_col:
+            easy = base_all[base_all[run_type_col] == "easy"].copy()
+        else:
+            easy = base_all.copy()
+
+        # baseline-window szűkítés (ne a teljes múlt)
+        if len(easy) > 0:
+            last_day = easy["Dátum"].max()
+            start = last_day - pd.Timedelta(weeks=baseline_weeks)
+            easy = easy[easy["Dátum"] >= start].copy()
+            if len(easy) < baseline_min_runs:
+                easy = easy.tail(baseline_min_runs).copy()
+
         easy_f = easy.dropna(subset=[fatigue_col]).copy()
-    else:
-        st.info("Nincs Fatigue_score → warning csak technikára nem elég stabil.")
-        easy_f = pd.DataFrame()
-
-    if len(easy_f) < 5:
-        st.info("Nincs elég easy + Fatigue_score adat (legalább ~5 futás).")
-    else:
-        last_red = easy_f.tail(n_red).copy()
-        last_yellow = easy_f.tail(n_yellow).copy()
-
-        last_red["hit_red"] = (last_red["Technika_index"] < tech_red) & (last_red[fatigue_col] > fat_red)
-        last_yellow["hit_yellow"] = (last_yellow["Technika_index"] < tech_yellow) | (last_yellow[fatigue_col] > fat_yellow)
-
-        red_hits = int(last_red["hit_red"].sum())
-        yellow_hits = int(last_yellow["hit_yellow"].sum())
-
-        status = "🟢 ZÖLD"
-        reason = "Stabil easy technika / fáradás kontrollált."
-        if red_hits >= need_red:
-            status = "🔴 PIROS"
-            reason = f"Utolsó {n_red} easy futásból {red_hits} találat: Tech < {tech_red} ÉS Fatigue > {fat_red}."
-        elif yellow_hits >= need_yellow:
-            status = "🟠 SÁRGA"
-            reason = f"Utolsó {n_yellow} easy futásból {yellow_hits} találat: Tech < {tech_yellow} VAGY Fatigue > {fat_yellow}."
-
-        if status.startswith("🔴"):
-            st.error(f"{status}  —  {reason}")
-        elif status.startswith("🟠"):
-            st.warning(f"{status}  —  {reason}")
+        if len(easy_f) < 5:
+            st.info("Nincs elég easy + Fatigue_score adat (legalább ~5 futás).")
         else:
-            st.success(f"{status}  —  {reason}")
+            last_red = easy_f.tail(n_red).copy()
+            last_yellow = easy_f.tail(n_yellow).copy()
 
-        c1, c2 = st.columns(2)
-        c1.metric("PIROS találatok", f"{red_hits}/{n_red}")
-        c2.metric("SÁRGA találatok", f"{yellow_hits}/{n_yellow}")
+            last_red["hit_red"] = (last_red["Technika_index"] < tech_red) & (last_red[fatigue_col] > fat_red)
+            last_yellow["hit_yellow"] = (last_yellow["Technika_index"] < tech_yellow) | (last_yellow[fatigue_col] > fat_yellow)
 
-        # kis idősor (vizuális)
-        show = easy_f.tail(max(n_yellow, n_red)).copy()
-        show["red_hit"] = (show["Technika_index"] < tech_red) & (show[fatigue_col] > fat_red)
-        show["yellow_hit"] = (show["Technika_index"] < tech_yellow) | (show[fatigue_col] > fat_yellow)
+            red_hits = int(last_red["hit_red"].sum())
+            yellow_hits = int(last_yellow["hit_yellow"].sum())
 
-        figw = px.scatter(show, x="Dátum", y="Technika_index", color="yellow_hit", symbol="red_hit",
-                          hover_data=["Cím"] if "Cím" in show.columns else None)
-        st.plotly_chart(figw, use_container_width=True)
+            status = "🟢 ZÖLD"
+            reason = "Stabil easy technika / fáradás kontrollált."
+            if red_hits >= need_red:
+                status = "🔴 PIROS"
+                reason = f"Utolsó {n_red} easy futásból {red_hits} találat: Tech < {tech_red} ÉS Fatigue > {fat_red}."
+            elif yellow_hits >= need_yellow:
+                status = "🟠 SÁRGA"
+                reason = f"Utolsó {n_yellow} easy futásból {yellow_hits} találat: Tech < {tech_yellow} VAGY Fatigue > {fat_yellow}."
 
-        with st.expander("📋 Részletek (táblázat)"):
-            cols = ["Dátum", "Technika_index", fatigue_col, "red_hit", "yellow_hit"]
-            if "Cím" in show.columns:
-                cols.append("Cím")
-            st.dataframe(show.sort_values("Dátum", ascending=False)[cols], use_container_width=True, hide_index=True)
-
-# =========================================================
-# TAB 4: Blokkok
-# =========================================================
-with tab4:
-    st.subheader("🧱 Edzésblokk összehasonlítás (easy fókusz)")
-
-    if run_type_col is None:
-        st.info("Run_type hiányzik – blokk összehasonlítás nem érhető el.")
-    else:
-        base_all = d.copy()
-        easy = base_all[base_all[run_type_col] == "easy"].dropna(subset=["Technika_index"]).sort_values("Dátum")
-        if fatigue_col:
-            easy = easy.dropna(subset=[fatigue_col])
-
-        if len(easy) < 10:
-            st.info("Nincs elég easy futás a blokk összehasonlításhoz.")
-        else:
-            col1, col2 = st.columns(2)
-            with col1:
-                st.markdown("### 🔵 Blokk A")
-                a_from, a_to = st.date_input(
-                    "Dátumtartomány A",
-                    value=(easy["Dátum"].iloc[-10].date(), easy["Dátum"].iloc[-1].date()),
-                    key="block_a"
-                )
-            with col2:
-                st.markdown("### 🟣 Blokk B")
-                b_from, b_to = st.date_input(
-                    "Dátumtartomány B",
-                    value=(easy["Dátum"].iloc[-20].date(), easy["Dátum"].iloc[-11].date()),
-                    key="block_b"
-                )
-
-            A = easy[(easy["Dátum"].dt.date >= a_from) & (easy["Dátum"].dt.date <= a_to)].copy()
-            B = easy[(easy["Dátum"].dt.date >= b_from) & (easy["Dátum"].dt.date <= b_to)].copy()
-
-            if len(A) < 3 or len(B) < 3:
-                st.warning("Mindkét blokkban legalább 3 easy futás kell.")
+            if status.startswith("🔴"):
+                st.error(f"{status} — {reason}")
+            elif status.startswith("🟠"):
+                st.warning(f"{status} — {reason}")
             else:
-                def stats(df_block):
-                    return {
-                        "futasok": len(df_block),
-                        "tech_avg": float(df_block["Technika_index"].mean()),
-                        "fat_avg": float(df_block[fatigue_col].mean()) if fatigue_col else np.nan,
-                    }
+                st.success(f"{status} — {reason}")
 
-                sA = stats(A)
-                sB = stats(B)
+            c1, c2 = st.columns(2)
+            c1.metric("PIROS találatok", f"{red_hits}/{n_red}")
+            c2.metric("SÁRGA találatok", f"{yellow_hits}/{n_yellow}")
 
-                # Időrendi értelmezés
-                A_is_later = A["Dátum"].max() > B["Dátum"].max()
-                newer = sA if A_is_later else sB
-                older = sB if A_is_later else sA
+            show = easy_f.tail(max(n_yellow, n_red)).copy()
+            show["red_hit"] = (show["Technika_index"] < tech_red) & (show[fatigue_col] > fat_red)
+            show["yellow_hit"] = (show["Technika_index"] < tech_yellow) | (show[fatigue_col] > fat_yellow)
 
-                st.markdown("### 🧠 Értelmezés (időrend helyes)")
-                st.write("✔️ Technika javult" if newer["tech_avg"] > older["tech_avg"] else "❌ Technika romlott")
-                if fatigue_col:
-                    st.write("✔️ Fáradás csökkent" if newer["fat_avg"] < older["fat_avg"] else "❌ Fáradás nőtt")
+            figw = px.scatter(
+                show,
+                x="Dátum",
+                y="Technika_index",
+                color="yellow_hit",
+                symbol="red_hit",
+                hover_data=["Cím"] if "Cím" in show.columns else None
+            )
+            st.plotly_chart(figw, use_container_width=True)
 
-                # Vizuális összevetés
-                comp = pd.DataFrame([
-                    ["Technika átlag", sA["tech_avg"], sB["tech_avg"]],
-                    ["Fatigue átlag", sA["fat_avg"], sB["fat_avg"]] if fatigue_col else ["Fatigue átlag", np.nan, np.nan],
-                    ["Futások száma", sA["futasok"], sB["futasok"]],
-                ], columns=["Mutató", "Blokk A", "Blokk B"])
+            with st.expander("📋 Részletek"):
+                cols = ["Dátum", "Technika_index", fatigue_col, "red_hit", "yellow_hit"]
+                if "Cím" in show.columns:
+                    cols.append("Cím")
+                st.dataframe(show.sort_values("Dátum", ascending=False)[cols], use_container_width=True, hide_index=True)
 
-                figb = px.bar(comp.melt(id_vars="Mutató", var_name="Blokk", value_name="Érték"),
-                              x="Mutató", y="Érték", color="Blokk", barmode="group")
-                st.plotly_chart(figb, use_container_width=True)
-
-                with st.expander("📋 Részletes táblázat"):
-                    st.dataframe(comp, use_container_width=True, hide_index=True)
-
-# =========================================================
-# TAB 5: Readiness
-# =========================================================
-with tab5:
+# -------------------------
+# READINESS TAB
+# -------------------------
+with tab_ready:
     st.subheader("🏁 Verseny-előrejelzés (Readiness) – 14 napos ablak")
 
-    if run_type_col is None or fatigue_col is None:
-        st.info("Readiness-hez kell a Run_type és a Fatigue_score.")
+    if run_type_col is None or fatigue_col is None or "Technika_index" not in d.columns:
+        st.info("Readiness-hez kell Run_type + Fatigue_score + Technika_index.")
     else:
-        base_all = d.copy().dropna(subset=["Dátum", "Technika_index"]).sort_values("Dátum")
+        base_all = d.dropna(subset=["Dátum", "Technika_index"]).sort_values("Dátum")
         easy = base_all[base_all[run_type_col] == "easy"].dropna(subset=[fatigue_col]).copy()
 
         if len(easy) < 10:
@@ -1113,9 +1037,8 @@ with tab5:
 
                 red_hits = int(((w["Technika_index"] < 35) & (w[fatigue_col] > 55)).sum())
 
-                all_easy = easy.copy()
-                tech_p25, tech_p75 = np.nanpercentile(all_easy["Technika_index"], [25, 75])
-                fat_p25, fat_p75 = np.nanpercentile(all_easy[fatigue_col], [25, 75])
+                tech_p25, tech_p75 = np.nanpercentile(easy["Technika_index"], [25, 75])
+                fat_p25, fat_p75 = np.nanpercentile(easy[fatigue_col], [25, 75])
 
                 def scale_up(v, lo, hi):
                     return float(np.clip(100 * (v - lo) / (hi - lo + 1e-9), 0, 100))
@@ -1159,15 +1082,17 @@ with tab5:
                         show_cols.append("Cím")
                     st.dataframe(w.sort_values("Dátum", ascending=False)[show_cols], use_container_width=True, hide_index=True)
 
-# =========================================================
-# TAB 6: Haladó adatok (táblázat csak itt)
-# =========================================================
-with tab6:
-    st.subheader("📋 Haladó adatok")
-    st.caption("Itt van minden táblázat: ha kell, innen tudsz mélyebbre menni.")
-    st.dataframe(view, use_container_width=True, hide_index=True)
+# -------------------------
+# ADATOK TAB (táblázat csak itt)
+# -------------------------
+with tab_data:
+    st.subheader("📄 Adatok (szűrve)")
+    st.caption("Itt vannak a részletes táblázatok – az elemzésekhez elég az első 4 tab.")
+    st.dataframe(view, use_container_width=True, hide_index=True, height=520)
 
-# ---- Logout
+# -------------------------
+# Logout
+# -------------------------
 st.sidebar.divider()
 if st.sidebar.button("Kijelentkezés"):
     st.session_state.auth_ok = False
