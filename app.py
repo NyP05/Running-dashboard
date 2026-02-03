@@ -272,6 +272,34 @@ def daily_coach_summary(base_all: pd.DataFrame,
         msg = "Az utolsó napokban csúszik a technika trend → holnap inkább könnyebb nap és több regeneráció."
 
     return status, msg
+def duration_to_seconds(x):
+    """
+    Garmin export: '01:52:42' vagy '00:00:27.7' vagy '--'
+    -> másodperc (float)
+    """
+    if pd.isna(x):
+        return np.nan
+    s = str(x).strip()
+    if s in ("", "--", "None", "nan"):
+        return np.nan
+
+    # tizedes levágás (00:00:27.7 -> 00:00:27)
+    s = s.replace(",", ".")  # ha valahol vessző van
+    s_main = s.split(".")[0]
+
+    parts = s_main.split(":")
+    try:
+        parts = [int(p) for p in parts]
+    except:
+        return np.nan
+
+    if len(parts) == 3:
+        h, m, sec = parts
+        return h * 3600 + m * 60 + sec
+    if len(parts) == 2:
+        m, sec = parts
+        return m * 60 + sec
+    return np.nan
 
     
 
@@ -694,6 +722,153 @@ with tab_overview:
         st.info("ℹ️ (Opció) daily_coach_summary nincs bekötve – csak a grafikonok/KPI futnak.")
 
     st.divider()
+
+        # =========================================================
+    # 📊 Heti terhelés & ramp rate
+    # =========================================================
+    st.subheader("📊 Heti terhelés & ramp rate")
+
+    base_all = d.copy()
+    base_all = base_all[base_all["Dátum"].notna()].sort_values("Dátum")
+
+    # --- távolság km
+    if "dist_km" not in base_all.columns:
+        if "Távolság" in base_all.columns:
+            base_all["dist_km"] = to_float_series(base_all["Távolság"])
+        else:
+            base_all["dist_km"] = np.nan
+
+    # --- emelkedés m
+    if "asc_m" not in base_all.columns:
+        if "Teljes emelkedés" in base_all.columns:
+            base_all["asc_m"] = to_float_series(base_all["Teljes emelkedés"])
+        else:
+            base_all["asc_m"] = np.nan
+
+    # --- idő sec (Idő / Menetidő / Eltelt idő)
+    time_col_candidates = [c for c in ["Idő", "Menetidő", "Eltelt idő"] if c in base_all.columns]
+    if time_col_candidates:
+        time_col = time_col_candidates[0]
+        base_all["dur_sec"] = base_all[time_col].apply(duration_to_seconds)
+    else:
+        base_all["dur_sec"] = np.nan
+
+    # --- Heti aggregálás (hétfői hétkezdéssel)
+    w = base_all.set_index("Dátum")
+    weekly = (
+        w.resample("W-MON")
+         .agg(week_km=("dist_km", "sum"),
+              week_sec=("dur_sec", "sum"),
+              week_elev=("asc_m", "sum"))
+         .reset_index()
+         .rename(columns={"Dátum": "week"})
+         .sort_values("week")
+    )
+
+    weekly["week_hours"] = weekly["week_sec"] / 3600.0
+
+    # --- Ramp rate: utolsó (teljes) hét vs előző 4 hét átlaga
+    rr_km = rr_time = rr_elev = np.nan
+
+    if len(weekly) >= 6:
+        last_idx = len(weekly) - 1
+
+        # ha a legutolsó hét "félkész" (nagyon kicsi), lépjünk vissza egyet
+        if weekly.loc[last_idx, "week_km"] < 0.3 * max(1e-9, weekly.loc[last_idx-1, "week_km"]):
+            last_idx -= 1
+
+        last_week = weekly.loc[last_idx]
+        prev4 = weekly.loc[last_idx-4:last_idx-1]
+
+        def ramp(curr, prev_mean):
+            if pd.isna(curr) or pd.isna(prev_mean) or prev_mean <= 0:
+                return np.nan
+            return (curr - prev_mean) / prev_mean * 100.0
+
+        rr_km = ramp(float(last_week["week_km"]), float(np.nanmean(prev4["week_km"])))
+        rr_time = ramp(float(last_week["week_hours"]), float(np.nanmean(prev4["week_hours"])))
+        rr_elev = ramp(float(last_week["week_elev"]), float(np.nanmean(prev4["week_elev"])))
+
+    # --- UI: metrika választó
+    metric = st.selectbox(
+        "Melyik terhelést nézzük?",
+        ["Heti km", "Heti idő (óra)", "Heti emelkedés (m)"],
+        index=0,
+        key="load_metric"
+    )
+
+    if metric == "Heti km":
+        y = "week_km"
+        rr = rr_km
+        ylabel = "km"
+    elif metric == "Heti idő (óra)":
+        y = "week_hours"
+        rr = rr_time
+        ylabel = "óra"
+    else:
+        y = "week_elev"
+        rr = rr_elev
+        ylabel = "m"
+
+    # --- Ramp badge
+    def ramp_badge(rr):
+        if pd.isna(rr):
+            return ("⚪", "Ramp rate: nincs elég adat (legalább 6 hét kell)")
+        if rr <= 8:
+            return ("🟢", f"Ramp rate: {rr:+.1f}% (biztonságos)")
+        if rr <= 12:
+            return ("🟠", f"Ramp rate: {rr:+.1f}% (figyelmeztető)")
+        return ("🔴", f"Ramp rate: {rr:+.1f}% (túl gyors emelés)")
+
+    badge, badge_txt = ramp_badge(rr)
+    st.caption(f"{badge} {badge_txt}")
+
+    # --- Heti oszlopdiagram
+    fig_week = px.bar(
+        weekly,
+        x="week",
+        y=y,
+        title=f"Heti terhelés – {metric}",
+        labels={"week": "Hét", y: ylabel},
+    )
+    st.plotly_chart(fig_week, use_container_width=True)
+
+    # --- Napi gördülő 7/28 napos trend (km / idő / elev)
+    daily = base_all.copy()
+    daily["date"] = daily["Dátum"].dt.date
+    daily = (
+        daily.groupby("date", as_index=False)
+             .agg(km=("dist_km", "sum"),
+                  sec=("dur_sec", "sum"),
+                  elev=("asc_m", "sum"))
+    )
+    daily["date"] = pd.to_datetime(daily["date"])
+    daily = daily.sort_values("date")
+
+    daily["km_7"] = daily["km"].rolling(7, min_periods=3).sum()
+    daily["km_28"] = daily["km"].rolling(28, min_periods=10).sum()
+
+    daily["h_7"] = (daily["sec"].rolling(7, min_periods=3).sum()) / 3600.0
+    daily["h_28"] = (daily["sec"].rolling(28, min_periods=10).sum()) / 3600.0
+
+    daily["elev_7"] = daily["elev"].rolling(7, min_periods=3).sum()
+    daily["elev_28"] = daily["elev"].rolling(28, min_periods=10).sum()
+
+    if metric == "Heti km":
+        fig_roll = px.line(daily, x="date", y=["km_7", "km_28"],
+                           title="Gördülő összeg – 7 nap vs 28 nap (km)")
+    elif metric == "Heti idő (óra)":
+        fig_roll = px.line(daily, x="date", y=["h_7", "h_28"],
+                           title="Gördülő összeg – 7 nap vs 28 nap (óra)")
+    else:
+        fig_roll = px.line(daily, x="date", y=["elev_7", "elev_28"],
+                           title="Gördülő összeg – 7 nap vs 28 nap (emelkedés)")
+
+    st.plotly_chart(fig_roll, use_container_width=True)
+
+    with st.expander("📋 Heti táblázat (részletek)"):
+        st.dataframe(weekly.tail(24), use_container_width=True, hide_index=True)
+
 
     # KPI-k (ha nincs technika/fatigue, akkor is menjen)
     tech_avg = view["Technika_index"].mean() if ("Technika_index" in view.columns and view["Technika_index"].notna().any()) else np.nan
