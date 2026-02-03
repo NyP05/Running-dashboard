@@ -300,6 +300,27 @@ def duration_to_seconds(x):
         m, sec = parts
         return m * 60 + sec
     return np.nan
+def hr_zone_from_pct(pct: float) -> str:
+    """
+    Egyszerű 5 zónás felosztás HRmax %-ból.
+    Z1: <60%
+    Z2: 60-70%
+    Z3: 70-80%
+    Z4: 80-90%
+    Z5: >=90%
+    """
+    if pd.isna(pct):
+        return np.nan
+    pct = float(pct)
+    if pct < 0.60:
+        return "Z1"
+    if pct < 0.70:
+        return "Z2"
+    if pct < 0.80:
+        return "Z3"
+    if pct < 0.90:
+        return "Z4"
+    return "Z5"
 
     
 
@@ -868,6 +889,162 @@ with tab_overview:
 
     with st.expander("📋 Heti táblázat (részletek)"):
         st.dataframe(weekly.tail(24), use_container_width=True, hide_index=True)
+    # =========================================================
+    # ⚡ Intenzitás megoszlás heti szinten
+    # easy/tempo/race arány + HR zónák
+    # =========================================================
+    st.subheader("⚡ Intenzitás megoszlás heti szinten")
+
+    base_all = d.copy()
+    base_all = base_all[base_all["Dátum"].notna()].sort_values("Dátum")
+
+    # --- futás szűrés (ha van Tevékenység típusa)
+    if "Tevékenység típusa" in base_all.columns:
+        m_run = base_all["Tevékenység típusa"].astype(str).str.contains("Fut", na=False)
+        base_all = base_all[m_run].copy()
+
+    if base_all.empty:
+        st.info("Nincs futás adat az intenzitás bontáshoz.")
+    else:
+        # --- távolság (km) ha kell
+        if "dist_km" not in base_all.columns:
+            if "Távolság" in base_all.columns:
+                base_all["dist_km"] = to_float_series(base_all["Távolság"])
+            else:
+                base_all["dist_km"] = np.nan
+
+        # --- HR (átlag)
+        hr_col_candidates = [c for c in ["hr_num", "Átlagos pulzusszám", "Átlagos pulzusszám "] if c in base_all.columns]
+        if "hr_num" in base_all.columns:
+            base_all["hr_avg"] = base_all["hr_num"]
+        elif hr_col_candidates:
+            base_all["hr_avg"] = to_float_series(base_all[hr_col_candidates[0]])
+        else:
+            base_all["hr_avg"] = np.nan
+
+        # --- Run_type fallback, ha nincs
+        if run_type_col and run_type_col in base_all.columns:
+            base_all["rt"] = base_all[run_type_col].astype(str)
+        else:
+            base_all["rt"] = "unknown"
+
+        # --- HR% és zóna
+        base_all["hr_pct"] = np.where(
+            base_all["hr_avg"].notna() & (hrmax > 0),
+            base_all["hr_avg"] / float(hrmax),
+            np.nan
+        )
+        base_all["hr_zone"] = base_all["hr_pct"].apply(hr_zone_from_pct)
+
+        # --- Heti bontás
+        w = base_all.set_index("Dátum")
+
+        # 1) heti összkilométer
+        weekly_km = w.resample("W-MON")["dist_km"].sum().rename("week_km").reset_index()
+
+        # 2) heti run_type arány (darabszám alapú)
+        rt_week = (
+            w.resample("W-MON")["rt"]
+             .value_counts()
+             .rename("count")
+             .reset_index()
+             .rename(columns={"Dátum": "week"})
+        )
+        rt_pivot = rt_week.pivot_table(index="week", columns="rt", values="count", fill_value=0).reset_index()
+        rt_cols = [c for c in rt_pivot.columns if c != "week"]
+        rt_pivot["total"] = rt_pivot[rt_cols].sum(axis=1)
+        for c in rt_cols:
+            rt_pivot[c] = np.where(rt_pivot["total"] > 0, rt_pivot[c] / rt_pivot["total"] * 100.0, 0.0)
+
+        # 3) heti HR zóna megoszlás (darabszám alapú)
+        hz_week = (
+            w.resample("W-MON")["hr_zone"]
+             .value_counts()
+             .rename("count")
+             .reset_index()
+             .rename(columns={"Dátum": "week"})
+        )
+        hz_pivot = hz_week.pivot_table(index="week", columns="hr_zone", values="count", fill_value=0).reset_index()
+        hz_cols = [c for c in ["Z1", "Z2", "Z3", "Z4", "Z5"] if c in hz_pivot.columns]
+        hz_pivot["total"] = hz_pivot[hz_cols].sum(axis=1) if hz_cols else 0
+        for c in hz_cols:
+            hz_pivot[c] = np.where(hz_pivot["total"] > 0, hz_pivot[c] / hz_pivot["total"] * 100.0, 0.0)
+
+        # --- UI választók
+        cL, cR = st.columns([1, 1])
+        with cL:
+            st.markdown("#### 🧩 Easy / Tempo / Race arány (heti %)")
+            if run_type_col and (("easy" in rt_cols) or ("tempo" in rt_cols) or ("race" in rt_cols)):
+                show_rts = [c for c in ["easy", "tempo", "race"] if c in rt_cols]
+                rt_long = rt_pivot[["week"] + show_rts].melt("week", var_name="Run_type", value_name="Percent")
+                fig_rt = px.bar(
+                    rt_long,
+                    x="week",
+                    y="Percent",
+                    color="Run_type",
+                    barmode="stack",
+                    labels={"week": "Hét", "Percent": "%"},
+                )
+                st.plotly_chart(fig_rt, use_container_width=True)
+            else:
+                st.info("Run_type hiányzik / nincs felismerve (easy/tempo/race).")
+
+        with cR:
+            st.markdown("#### ❤️ HR zóna megoszlás (heti %)")
+            if base_all["hr_zone"].notna().sum() >= 5 and hz_cols:
+                hz_long = hz_pivot[["week"] + hz_cols].melt("week", var_name="Zone", value_name="Percent")
+                fig_hz = px.bar(
+                    hz_long,
+                    x="week",
+                    y="Percent",
+                    color="Zone",
+                    barmode="stack",
+                    labels={"week": "Hét", "Percent": "%"},
+                )
+                st.plotly_chart(fig_hz, use_container_width=True)
+            else:
+                st.info("Kevés / hiányzó pulzus adat a zónákhoz (vagy HRmax nincs megadva).")
+
+        st.divider()
+
+        # --- Kombinált “miért magas a fatigue?” nézet:
+        # heti km + magas intenzitás arány (Z4+Z5)
+        st.markdown("#### 🔎 Terhelés vs Intenzitás (heti km + Z4/Z5 arány)")
+
+        if hz_cols:
+            hz_pivot["hi_intensity_pct"] = 0.0
+            if "Z4" in hz_pivot.columns:
+                hz_pivot["hi_intensity_pct"] += hz_pivot["Z4"]
+            if "Z5" in hz_pivot.columns:
+                hz_pivot["hi_intensity_pct"] += hz_pivot["Z5"]
+
+            combo = weekly_km.rename(columns={"Dátum": "week"}).merge(
+                hz_pivot[["week", "hi_intensity_pct"]], on="week", how="left"
+            )
+            combo["hi_intensity_pct"] = combo["hi_intensity_pct"].fillna(0.0)
+
+            fig_combo = px.scatter(
+                combo,
+                x="week_km",
+                y="hi_intensity_pct",
+                hover_data=["week"],
+                labels={"week_km": "Heti km", "hi_intensity_pct": "Z4+Z5 %"},
+            )
+            st.plotly_chart(fig_combo, use_container_width=True)
+
+            # gyors “coach” értelmezés
+            if len(combo.dropna(subset=["week_km"])) >= 4:
+                last = combo.iloc[-1]
+                msg = f"Utolsó hét: **{last['week_km']:.1f} km**, magas intenzitás (Z4+Z5): **{last['hi_intensity_pct']:.0f}%**."
+                if last["hi_intensity_pct"] >= 30:
+                    st.warning("🟠 Sok a magas intenzitás (Z4+Z5) → ez önmagában felnyomhatja a Fatigue_score-t.")
+                    st.caption(msg)
+                else:
+                    st.success("🟢 A magas intenzitás arány nem extrém → ha magas a Fatigue_score, inkább a terhelés/ramp vagy technikai faktor lehet.")
+                    st.caption(msg)
+
+        else:
+            st.info("HR zóna adatok nélkül a 'Terhelés vs Intenzitás' ábra nem készíthető el.")
 
 
     # KPI-k (ha nincs technika/fatigue, akkor is menjen)
