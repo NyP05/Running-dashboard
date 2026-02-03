@@ -667,6 +667,26 @@ slope_col = safe_col(d, "slope_bucket")
 # Sidebar: Szűrők + Baseline
 # -------------------------
 st.sidebar.divider()
+# -------------------------
+# HRmax (globális, hogy minden tabban létezzen)
+# -------------------------
+if "hrmax" not in st.session_state:
+    st.session_state.hrmax = 190  # default
+
+st.sidebar.divider()
+st.sidebar.header("Intenzitás (HR zónák)")
+
+st.session_state.hrmax = st.sidebar.number_input(
+    "HRmax (ütés/perc) – zónákhoz",
+    min_value=120,
+    max_value=240,
+    value=int(st.session_state.hrmax),
+    step=1,
+    help="Ha nem tudod pontosan, hagyd 185–195 körül; a zónák becslések."
+)
+
+hrmax = int(st.session_state.hrmax)  # <- EZT használja majd a heti intenzitás blokk
+
 st.sidebar.header("Szűrők")
 
 min_date = pd.to_datetime(d["Dátum"], errors="coerce").dropna().min()
