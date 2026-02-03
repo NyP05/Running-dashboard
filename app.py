@@ -764,7 +764,7 @@ with tab_overview:
 
     st.divider()
 
-        # =========================================================
+    # =========================================================
     # 📊 Heti terhelés & ramp rate
     # =========================================================
     st.subheader("📊 Heti terhelés & ramp rate")
@@ -1140,6 +1140,84 @@ with tab_overview:
             st.caption(f"Medián határok: Technika {tech_med:.1f}, Fatigue {fat_med:.1f}")
         else:
             st.info("Kevés Technika/Fatigue adat a kvadránshoz.")
+    # =========================================================
+# TERHELÉS vs TECHNIKA (heti szinten)
+# =========================================================
+st.divider()
+st.subheader("🧭 Terhelés vs Technika (heti trend)")
+
+# szükséges oszlopok
+need_cols = ["Dátum", "Technika_index"]
+if not all(c in d.columns for c in need_cols):
+    st.info("Nincs elég adat a terhelés–technika elemzéshez.")
+else:
+    # ---- heti aggregálás
+    w = d.dropna(subset=["Dátum", "Technika_index"]).copy()
+    w["week"] = w["Dátum"].dt.to_period("W").astype(str)
+
+    agg = {
+        "Technika_index": "mean"
+    }
+
+    # terhelés forrás kiválasztása
+    load_col = None
+    if "Távolság" in w.columns:
+        load_col = "Távolság"
+        agg[load_col] = "sum"
+        load_label = "Heti táv (km)"
+    elif "Idő" in w.columns:
+        load_col = "Idő"
+        agg[load_col] = "sum"
+        load_label = "Heti idő"
+    else:
+        st.info("Nincs Távolság vagy Idő oszlop a terheléshez.")
+        load_col = None
+
+    if load_col:
+        weekly = w.groupby("week").agg(agg).reset_index()
+        weekly = weekly.sort_values("week")
+
+        if len(weekly) < 6:
+            st.info("Kevés heti adat (min. ~6 hét ajánlott).")
+        else:
+            # ---- trend számítás (utolsó 6 hét)
+            last = weekly.tail(6)
+
+            tech_trend = np.polyfit(range(len(last)), last["Technika_index"], 1)[0]
+            load_trend = np.polyfit(range(len(last)), last[load_col], 1)[0]
+
+            # ---- értelmezés
+            if load_trend > 0 and tech_trend < 0:
+                verdict = "🔴 Terhelés nő, technika romlik → túlterhelés gyanú"
+            elif load_trend > 0 and tech_trend < 0.05:
+                verdict = "🟠 Terhelés nő, technika stagnál → határon"
+            elif load_trend > 0 and tech_trend > 0:
+                verdict = "🟢 Terhelés nő, technika javul → adaptáció"
+            else:
+                verdict = "ℹ️ Nincs egyértelmű trend"
+
+            st.markdown(f"### {verdict}")
+
+            # ---- vizualizáció
+            fig = px.scatter(
+                weekly,
+                x=load_col,
+                y="Technika_index",
+                trendline="ols",
+                hover_data=["week"],
+                labels={
+                    load_col: load_label,
+                    "Technika_index": "Heti átlag Technika_index"
+                }
+            )
+            st.plotly_chart(fig, use_container_width=True)
+
+            # ---- kis magyarázat
+            st.caption(
+                "🔍 Minden pont egy hét. "
+                "Balról jobbra nő a terhelés, fentről lefelé romlik a technika."
+            )
+
 
     with cB:
         st.subheader("🏅 Top / Bottom futások")
@@ -1167,7 +1245,7 @@ with tab_overview:
 # UTOLSÓ FUTÁS: vizuális baseline összevetés + jelzések
 # -------------------------
 with tab_last:
-    st.subheader("🔎 Utolsó futás elemzése (kevesebb táblázat, több jelzés)")
+    st.subheader("🔎 Utolsó futás elemzése")
 
     if "Technika_index" not in d.columns:
         st.info("Nincs Technika_index – az utolsó futás technika elemzéséhez számított index kell.")
