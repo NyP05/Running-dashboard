@@ -1140,83 +1140,133 @@ with tab_overview:
             st.caption(f"Medián határok: Technika {tech_med:.1f}, Fatigue {fat_med:.1f}")
         else:
             st.info("Kevés Technika/Fatigue adat a kvadránshoz.")
-    # =========================================================
-# TERHELÉS vs TECHNIKA (heti szinten)
+# =========================================================
+# TERHELÉS vs TECHNIKA (heti szinten) — ROBOSZTUS CSV-HEZ
 # =========================================================
 st.divider()
 st.subheader("🧭 Terhelés vs Technika (heti trend)")
 
-# szükséges oszlopok
+def _to_minutes(x):
+    """'HH:MM:SS' vagy 'MM:SS' -> perc (float)."""
+    if pd.isna(x):
+        return np.nan
+    s = str(x).strip()
+    if s in ("--", "", "None", "nan"):
+        return np.nan
+    try:
+        parts = s.split(":")
+        if len(parts) == 3:
+            h, m, sec = parts
+            return int(h) * 60 + int(m) + int(sec) / 60
+        if len(parts) == 2:
+            m, sec = parts
+            return int(m) + int(sec) / 60
+    except:
+        return np.nan
+    return np.nan
+
 need_cols = ["Dátum", "Technika_index"]
 if not all(c in d.columns for c in need_cols):
     st.info("Nincs elég adat a terhelés–technika elemzéshez.")
 else:
-    # ---- heti aggregálás
     w = d.dropna(subset=["Dátum", "Technika_index"]).copy()
     w["week"] = w["Dátum"].dt.to_period("W").astype(str)
 
-    agg = {
-        "Technika_index": "mean"
-    }
-
-    # terhelés forrás kiválasztása
+    # ---- terhelés forrás kiválasztása + KONVERZIÓ
     load_col = None
-    if "Távolság" in w.columns:
-        load_col = "Távolság"
-        agg[load_col] = "sum"
+    load_label = None
+
+    if "dist_km" in w.columns and w["dist_km"].notna().any():
+        # nálad már van dist_km (NUM_MAP-ből) → ez a legstabilabb
+        load_col = "dist_km"
         load_label = "Heti táv (km)"
-    elif "Idő" in w.columns:
-        load_col = "Idő"
-        agg[load_col] = "sum"
-        load_label = "Heti idő"
+
+    elif "Távolság" in w.columns and w["Távolság"].notna().any():
+        # fallback: Távolság oszlop → float
+        w["_load"] = to_float_series(w["Távolság"])
+        load_col = "_load"
+        load_label = "Heti táv (km)"
+
+    elif "Idő" in w.columns and w["Idő"].notna().any():
+        # idő → perc
+        w["_load"] = w["Idő"].apply(_to_minutes)
+        load_col = "_load"
+        load_label = "Heti idő (perc)"
+
     else:
-        st.info("Nincs Távolság vagy Idő oszlop a terheléshez.")
-        load_col = None
+        st.info("Nincs Távolság / dist_km / Idő adat a heti terheléshez.")
 
     if load_col:
-        weekly = w.groupby("week").agg(agg).reset_index()
-        weekly = weekly.sort_values("week")
+        weekly = (
+            w.groupby("week", as_index=False)
+             .agg(
+                 load_sum=(load_col, "sum"),
+                 tech_mean=("Technika_index", "mean"),
+                 runs=("Technika_index", "count")
+             )
+             .sort_values("week")
+        )
+
+        # kis tisztítás
+        weekly = weekly.replace([np.inf, -np.inf], np.nan)
+        weekly = weekly.dropna(subset=["load_sum", "tech_mean"])
 
         if len(weekly) < 6:
             st.info("Kevés heti adat (min. ~6 hét ajánlott).")
         else:
-            # ---- trend számítás (utolsó 6 hét)
-            last = weekly.tail(6)
+            last = weekly.tail(6).copy()
 
-            tech_trend = np.polyfit(range(len(last)), last["Technika_index"], 1)[0]
-            load_trend = np.polyfit(range(len(last)), last[load_col], 1)[0]
+            # polyfit csak akkor, ha van elég változás és nincs NaN
+            x = np.arange(len(last), dtype=float)
+            y_load = last["load_sum"].to_numpy(dtype=float)
+            y_tech = last["tech_mean"].to_numpy(dtype=float)
 
-            # ---- értelmezés
-            if load_trend > 0 and tech_trend < 0:
-                verdict = "🔴 Terhelés nő, technika romlik → túlterhelés gyanú"
-            elif load_trend > 0 and tech_trend < 0.05:
-                verdict = "🟠 Terhelés nő, technika stagnál → határon"
-            elif load_trend > 0 and tech_trend > 0:
-                verdict = "🟢 Terhelés nő, technika javul → adaptáció"
+            # ha konstans / üres, ne erőltessük
+            if np.nanstd(y_load) < 1e-9 or np.nanstd(y_tech) < 1e-9:
+                verdict = "ℹ️ Nincs elég változás a trendhez (közel konstans sorozat)."
+                st.info(verdict)
             else:
-                verdict = "ℹ️ Nincs egyértelmű trend"
+                tech_trend = np.polyfit(x, y_tech, 1)[0]
+                load_trend = np.polyfit(x, y_load, 1)[0]
 
-            st.markdown(f"### {verdict}")
+                if load_trend > 0 and tech_trend < 0:
+                    verdict = "🔴 Terhelés nő, technika romlik → túlterhelés gyanú"
+                elif load_trend > 0 and tech_trend < 0.05:
+                    verdict = "🟠 Terhelés nő, technika stagnál → határon"
+                elif load_trend > 0 and tech_trend > 0:
+                    verdict = "🟢 Terhelés nő, technika javul → adaptáció"
+                else:
+                    verdict = "ℹ️ Nincs egyértelmű trend"
 
-            # ---- vizualizáció
+                st.markdown(f"### {verdict}")
+
+            # ---- vizuál: heti pontok + trendline
             fig = px.scatter(
                 weekly,
-                x=load_col,
-                y="Technika_index",
+                x="load_sum",
+                y="tech_mean",
                 trendline="ols",
-                hover_data=["week"],
+                hover_data=["week", "runs"],
                 labels={
-                    load_col: load_label,
-                    "Technika_index": "Heti átlag Technika_index"
-                }
+                    "load_sum": load_label,
+                    "tech_mean": "Heti átlag Technika_index",
+                    "runs": "Futások / hét"
+                },
             )
             st.plotly_chart(fig, use_container_width=True)
 
-            # ---- kis magyarázat
-            st.caption(
-                "🔍 Minden pont egy hét. "
-                "Balról jobbra nő a terhelés, fentről lefelé romlik a technika."
-            )
+            # opcionális: heti idősor is (jobban „coach”)
+            with st.expander("📈 Heti idősor (terhelés + technika)", expanded=False):
+                wlong = weekly.melt(
+                    id_vars="week",
+                    value_vars=["load_sum", "tech_mean"],
+                    var_name="mutató",
+                    value_name="érték"
+                )
+                fig2 = px.line(wlong, x="week", y="érték", color="mutató")
+                st.plotly_chart(fig2, use_container_width=True)
+
+            st.caption("🔍 Minden pont egy hét: balról jobbra nő a terhelés, fentről lefelé romlik a technika.")
 
 
     with cB:
