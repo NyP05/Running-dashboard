@@ -1170,25 +1170,23 @@ if not all(c in d.columns for c in need_cols):
     st.info("Nincs elég adat a terhelés–technika elemzéshez.")
 else:
     w = d.dropna(subset=["Dátum", "Technika_index"]).copy()
-    w["week"] = w["Dátum"].dt.to_period("W").astype(str)
+    w["week_start"] = w["Dátum"].dt.to_period("W").dt.start_time  # időrendhez stabil
+    w["week"] = w["week_start"].dt.strftime("%Y-%m-%d")
 
     # ---- terhelés forrás kiválasztása + KONVERZIÓ
     load_col = None
     load_label = None
 
     if "dist_km" in w.columns and w["dist_km"].notna().any():
-        # nálad már van dist_km (NUM_MAP-ből) → ez a legstabilabb
         load_col = "dist_km"
         load_label = "Heti táv (km)"
 
     elif "Távolság" in w.columns and w["Távolság"].notna().any():
-        # fallback: Távolság oszlop → float
         w["_load"] = to_float_series(w["Távolság"])
         load_col = "_load"
         load_label = "Heti táv (km)"
 
     elif "Idő" in w.columns and w["Idő"].notna().any():
-        # idő → perc
         w["_load"] = w["Idő"].apply(_to_minutes)
         load_col = "_load"
         load_label = "Heti idő (perc)"
@@ -1198,16 +1196,15 @@ else:
 
     if load_col:
         weekly = (
-            w.groupby("week", as_index=False)
+            w.groupby(["week_start", "week"], as_index=False)
              .agg(
                  load_sum=(load_col, "sum"),
                  tech_mean=("Technika_index", "mean"),
-                 runs=("Technika_index", "count")
+                 runs=("Technika_index", "count"),
              )
-             .sort_values("week")
+             .sort_values("week_start")
         )
 
-        # kis tisztítás
         weekly = weekly.replace([np.inf, -np.inf], np.nan)
         weekly = weekly.dropna(subset=["load_sum", "tech_mean"])
 
@@ -1216,12 +1213,11 @@ else:
         else:
             last = weekly.tail(6).copy()
 
-            # polyfit csak akkor, ha van elég változás és nincs NaN
+            # ---- trend ítélet (utolsó 6 hét)
             x = np.arange(len(last), dtype=float)
             y_load = last["load_sum"].to_numpy(dtype=float)
             y_tech = last["tech_mean"].to_numpy(dtype=float)
 
-            # ha konstans / üres, ne erőltessük
             if np.nanstd(y_load) < 1e-9 or np.nanstd(y_tech) < 1e-9:
                 verdict = "ℹ️ Nincs elég változás a trendhez (közel konstans sorozat)."
                 st.info(verdict)
@@ -1240,57 +1236,61 @@ else:
 
                 st.markdown(f"### {verdict}")
 
-            # ---- vizuál: heti pontok + trendline
+            # ---- vizuál 1: Load vs Tech scatter + trendvonal (statsmodels nélkül)
             fig = px.scatter(
                 weekly,
                 x="load_sum",
                 y="tech_mean",
-                trendline="ols",
                 hover_data=["week", "runs"],
                 labels={
                     "load_sum": load_label,
                     "tech_mean": "Heti átlag Technika_index",
-                    "runs": "Futások / hét"
+                    "runs": "Futások / hét",
                 },
             )
+
+            tmp = weekly[["load_sum", "tech_mean"]].dropna().copy()
+            if len(tmp) >= 3 and tmp["load_sum"].nunique() >= 2:
+                xfit = tmp["load_sum"].to_numpy(dtype=float)
+                yfit = tmp["tech_mean"].to_numpy(dtype=float)
+
+                m, b = np.polyfit(xfit, yfit, 1)
+                xs = np.linspace(xfit.min(), xfit.max(), 40)
+                ys = m * xs + b
+                fig.add_scatter(x=xs, y=ys, mode="lines", name="Trend")
+
             st.plotly_chart(fig, use_container_width=True)
 
-            # opcionális: heti idősor is (jobban „coach”)
+            # ---- vizuál 2: Heti idősor (két tengely)
             with st.expander("📈 Heti idősor (terhelés + technika)", expanded=False):
-                wlong = weekly.melt(
-                    id_vars="week",
-                    value_vars=["load_sum", "tech_mean"],
-                    var_name="mutató",
-                    value_name="érték"
+                fig2 = px.line(
+                    weekly,
+                    x="week_start",
+                    y="load_sum",
+                    labels={"week_start": "Hét", "load_sum": load_label},
                 )
-                fig2 = px.line(wlong, x="week", y="érték", color="mutató")
+                fig2.update_traces(name="Terhelés", showlegend=True)
+
+                fig3 = px.line(
+                    weekly,
+                    x="week_start",
+                    y="tech_mean",
+                    labels={"week_start": "Hét", "tech_mean": "Heti átlag Technika_index"},
+                )
+                for tr in fig3.data:
+                    tr.update(yaxis="y2", name="Technika", showlegend=True)
+                    fig2.add_trace(tr)
+
+                fig2.update_layout(
+                    yaxis=dict(title=load_label),
+                    yaxis2=dict(title="Technika_index", overlaying="y", side="right"),
+                    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+                )
+
                 st.plotly_chart(fig2, use_container_width=True)
 
             st.caption("🔍 Minden pont egy hét: balról jobbra nő a terhelés, fentről lefelé romlik a technika.")
 
-
-
-    with cB:
-        st.subheader("🏅 Top / Bottom futások")
-        with st.expander("Megnyitás", expanded=False):
-            topn = st.slider("N", 5, 30, 10, key="topn_overview")
-            if "Technika_index" in view.columns and view["Technika_index"].notna().any():
-                cols = ["Dátum"]
-                if run_type_col: cols.append(run_type_col)
-                if slope_col: cols.append(slope_col)
-                cols += ["Technika_index"]
-                if fatigue_col: cols.append(fatigue_col)
-                if "Cím" in view.columns: cols.append("Cím")
-
-                top = view.sort_values("Technika_index", ascending=False).head(topn)
-                bot = view.sort_values("Technika_index", ascending=True).head(topn)
-
-                st.markdown("**⬆️ Top technika**")
-                st.dataframe(top[cols], use_container_width=True, hide_index=True, height=260)
-                st.markdown("**⬇️ Bottom technika**")
-                st.dataframe(bot[cols], use_container_width=True, hide_index=True, height=260)
-            else:
-                st.info("Nincs Technika_index a top/bottom listához.")
 
 # -------------------------
 # UTOLSÓ FUTÁS: vizuális baseline összevetés + jelzések
