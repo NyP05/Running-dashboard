@@ -1269,6 +1269,7 @@ else:
             st.caption("🔍 Minden pont egy hét: balról jobbra nő a terhelés, fentről lefelé romlik a technika.")
 
 
+
     with cB:
         st.subheader("🏅 Top / Bottom futások")
         with st.expander("Megnyitás", expanded=False):
