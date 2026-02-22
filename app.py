@@ -541,6 +541,15 @@ if valid_pace.notna().sum() >= 30:
         return "race"
 
     df["Run_type"] = df.apply(classify_from_pace, axis=1)
+    # ✅ Run_type normalizálás (CSV/XLSX eltérések + szóközök miatt)
+if "Run_type" in df.columns:
+    df["Run_type"] = (
+        df["Run_type"]
+        .astype(str)
+        .str.strip()
+        .str.lower()
+        .replace({"none": np.nan, "nan": np.nan, "": np.nan})
+    )
 
 # =========================================================
 # 6) TECHNIKA_INDEX (slope-aware + speed bin)
@@ -1351,131 +1360,163 @@ with tab_last:
 
     if "Technika_index" not in d.columns:
         st.info("Nincs Technika_index – az utolsó futás technika elemzéséhez számított index kell.")
-    else:
-        base = d.dropna(subset=["Dátum", "Technika_index"]).sort_values("Dátum")
-        if len(base) == 0:
-            st.info("Nincs elég adat (Dátum + Technika_index).")
-        else:
-            options = base.tail(60).copy()
+        st.stop()
 
-            def label_row(r):
-                title = r["Cím"] if "Cím" in options.columns and pd.notna(r.get("Cím")) else ""
-                rt = r["Run_type"] if "Run_type" in options.columns and pd.notna(r.get("Run_type")) else ""
-                return f"{r['Dátum'].strftime('%Y-%m-%d %H:%M')} | {rt} | {title}"[:120]
+    base = d.dropna(subset=["Dátum", "Technika_index"]).sort_values("Dátum")
+    if len(base) == 0:
+        st.info("Nincs elég adat (Dátum + Technika_index).")
+        st.stop()
 
-            options["__label"] = options.apply(label_row, axis=1)
-            chosen_label = st.selectbox("Futás kiválasztása", options["__label"].tolist(), index=len(options)-1, key="pick_last")
-            last = options.loc[options["__label"] == chosen_label].iloc[0]
+    options = base.tail(60).copy()
 
-            # --- Baseline választás (Auto: run_type szerint / Mindig easy)
-        last_type = None
-        if run_type_col and run_type_col in base.columns and pd.notna(last.get(run_type_col)):
-            last_type = str(last.get(run_type_col)).strip().lower()
+    def label_row(r):
+        title = r["Cím"] if "Cím" in options.columns and pd.notna(r.get("Cím")) else ""
+        rt = r["Run_type"] if "Run_type" in options.columns and pd.notna(r.get("Run_type")) else ""
+        return f"{r['Dátum'].strftime('%Y-%m-%d %H:%M')} | {rt} | {title}"[:120]
 
-        if baseline_mode == "Auto (Run_type szerint)" and last_type in ("easy", "tempo", "race"):
-            baseline_full = get_type_baseline(
+    options["__label"] = options.apply(label_row, axis=1)
+    chosen_label = st.selectbox(
+        "Futás kiválasztása",
+        options["__label"].tolist(),
+        index=len(options) - 1,
+        key="pick_last"
+    )
+    last = options.loc[options["__label"] == chosen_label].iloc[0]
+
+    # --- last Run_type (normalizált)
+    last_type = None
+    if run_type_col and run_type_col in base.columns and pd.notna(last.get(run_type_col)):
+        last_type = str(last.get(run_type_col)).strip().lower()
+
+    # --- Baseline választás (Auto: run_type szerint / Mindig easy)
+    if baseline_mode == "Auto (Run_type szerint)" and last_type in ("easy", "tempo", "race"):
+        baseline_full = get_type_baseline(
             base_df=base,
             last_date=last["Dátum"],
             run_type_col=run_type_col,
             target_type=last_type,
             weeks=baseline_weeks,
-         min_runs=baseline_min_runs
-             )
-            st.caption(f"Baseline: **{last_type}** futások (hetek: {baseline_weeks}, min: {baseline_min_runs})")
-        else:
-            baseline_full = get_easy_baseline(
+            min_runs=baseline_min_runs
+        )
+        st.caption(f"Baseline: **{last_type}** futások (hetek: {baseline_weeks}, min: {baseline_min_runs})")
+    else:
+        baseline_full = get_easy_baseline(
             base_df=base,
             last_date=last["Dátum"],
             weeks=baseline_weeks,
-         min_runs=baseline_min_runs
-             )
-            st.caption(f"Baseline: **easy** futások (hetek: {baseline_weeks}, min: {baseline_min_runs})")
+            min_runs=baseline_min_runs
+        )
+        st.caption(f"Baseline: **easy** futások (hetek: {baseline_weeks}, min: {baseline_min_runs})")
 
-            # KPI-k
-            c1, c2, c3, c4 = st.columns(4)
-            c1.metric("Technika_index", f"{float(last['Technika_index']):.1f}")
-            c2.metric("Fatigue_score", f"{float(last.get('Fatigue_score')):.1f}" if pd.notna(last.get("Fatigue_score")) else "—")
-            c3.metric("Run_type", str(last.get("Run_type")) if pd.notna(last.get("Run_type")) else "—")
-            pace = last.get("Átlagos tempó") if "Átlagos tempó" in base.columns else None
-            dist = last.get("Távolság") if "Távolság" in base.columns else None
-            c4.metric("Tempó / Táv", f"{pace} / {dist} km" if (pd.notna(pace) or pd.notna(dist)) else "—")
+    # -------------------------
+    # KPI-k
+    # -------------------------
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Technika_index", f"{float(last['Technika_index']):.1f}")
 
-            if "Cím" in base.columns and pd.notna(last.get("Cím")):
-                st.caption(f"**Cím:** {last['Cím']}")
+    fat_val = last.get("Fatigue_score")
+    c2.metric("Fatigue_score", f"{float(fat_val):.1f}" if pd.notna(fat_val) else "—")
 
-            st.caption(f"Baseline easy futások száma: {len(baseline_full)} (hetek: {baseline_weeks})")
+    c3.metric("Run_type", str(last.get("Run_type")) if pd.notna(last.get("Run_type")) else "—")
 
-            if len(baseline_full) < 8:
-                st.info("Kevés baseline easy futás – az összevetés bizonytalan. (Ajánlott ≥ 8–10)")
+    pace = last.get("Átlagos tempó") if "Átlagos tempó" in base.columns else None
+    dist = last.get("Távolság") if "Távolság" in base.columns else None
+    c4.metric("Tempó / Táv", f"{pace} / {dist} km" if (pd.notna(pace) or pd.notna(dist)) else "—")
+
+    if "Cím" in base.columns and pd.notna(last.get("Cím")):
+        st.caption(f"**Cím:** {last['Cím']}")
+
+    st.caption(f"Baseline futások száma: **{len(baseline_full)}**")
+
+    # -------------------------
+    # Ha nincs elég baseline → magyarázat + debug (hogy lásd mi a gond)
+    # -------------------------
+    if len(baseline_full) < 8:
+        st.info("Kevés baseline futás a biztos elemzéshez. (Ajánlott ≥ 8–10)")
+
+        # DEBUG: miért üres?
+        if "Run_type" in base.columns:
+            cnts = base["Run_type"].value_counts(dropna=False).head(10)
+            st.write("DEBUG Run_type megoszlás (utolsó 60 technikás futásból):")
+            st.dataframe(cnts.rename("db").reset_index().rename(columns={"index": "Run_type"}), hide_index=True)
+
+            st.write("DEBUG last_type:", last_type)
+            st.write("DEBUG baseline_mode:", baseline_mode)
+
+        st.stop()
+
+    # -------------------------
+    # Baseline összevetés (metrikák)
+    # -------------------------
+    compare_cols = [
+        ("Átl. pedálütem", "Cadence (spm)", "cadence_stability"),
+        ("Átlagos lépéshossz", "Lépéshossz (m)", "higher_better"),
+        ("Átlagos függőleges arány", "Vertical Ratio (%)", "lower_better"),
+        ("Átlagos függőleges oszcilláció", "Vertical Osc (cm)", "lower_better"),
+        ("Átlagos talajérintési idő", "GCT (ms)", "lower_better"),
+        ("Átlagos pulzusszám", "Átlag pulzus", "context"),
+        ("Max. pulzusszám", "Max pulzus", "context"),
+    ]
+
+    rows = []
+    for col, label, rule in compare_cols:
+        if col not in base.columns:
+            continue
+        v = num(last.get(col))
+        b = med(baseline_full[col])
+        if pd.isna(v) or pd.isna(b) or b == 0:
+            continue
+
+        delta_pct = (v - b) / b * 100.0
+
+        if rule == "lower_better":
+            good = -delta_pct
+        elif rule == "higher_better":
+            good = delta_pct
+        elif rule == "cadence_stability":
+            good = -abs(delta_pct)
+        else:
+            good = 0.0
+
+        rows.append([label, float(v), float(b), float(delta_pct), float(good), rule])
+
+    if not rows:
+        st.info("Nincs elég összehasonlítható metrika az utolsó futáshoz (hiányos oszlopok / NaN).")
+        st.stop()
+
+    comp = pd.DataFrame(rows, columns=["Mutató", "Utolsó", "Baseline", "Eltérés_%", "Jó_irány", "rule"])
+
+    st.markdown("### 📈 Eltérések a baseline-hoz képest")
+    figd = px.bar(
+        comp.sort_values("Jó_irány"),
+        x="Jó_irány",
+        y="Mutató",
+        orientation="h",
+        hover_data=["Utolsó", "Baseline", "Eltérés_%", "rule"]
+    )
+    st.plotly_chart(figd, use_container_width=True)
+
+    st.markdown("### 🚩 Gyors jelzések")
+    msgs = []
+    for _, r in comp.iterrows():
+        if r["rule"] in ("lower_better", "higher_better"):
+            if r["Jó_irány"] < -5:
+                msgs.append(f"🔴 **{r['Mutató']}** romlott (≈ {r['Eltérés_%']:+.1f}%).")
+            elif r["Jó_irány"] < -2:
+                msgs.append(f"🟠 **{r['Mutató']}** kicsit romlott (≈ {r['Eltérés_%']:+.1f}%).")
             else:
-                compare_cols = [
-                    ("Átl. pedálütem", "Cadence (spm)", "cadence_stability"),
-                    ("Átlagos lépéshossz", "Lépéshossz (m)", "higher_better"),
-                    ("Átlagos függőleges arány", "Vertical Ratio (%)", "lower_better"),
-                    ("Átlagos függőleges oszcilláció", "Vertical Osc (cm)", "lower_better"),
-                    ("Átlagos talajérintési idő", "GCT (ms)", "lower_better"),
-                    ("Átlagos pulzusszám", "Átlag pulzus", "context"),
-                    ("Max. pulzus", "Max pulzus", "context"),
-                ]
+                msgs.append(f"🟢 **{r['Mutató']}** rendben (≈ {r['Eltérés_%']:+.1f}%).")
+        elif r["rule"] == "cadence_stability":
+            if abs(r["Eltérés_%"]) > 5:
+                msgs.append(f"🟠 **{r['Mutató']}** eltér a baseline-tól (≈ {r['Eltérés_%']:+.1f}%).")
+            else:
+                msgs.append(f"🟢 **{r['Mutató']}** stabil (≈ {r['Eltérés_%']:+.1f}%).")
 
-                rows = []
-                for col, label, rule in compare_cols:
-                    if col not in base.columns:
-                        continue
-                    v = num(last.get(col))
-                    b = med(baseline_full[col])
-                    if pd.isna(v) or pd.isna(b) or b == 0:
-                        continue
+    for m in msgs[:10]:
+        st.write(m)
 
-                    delta_pct = (v - b) / b * 100.0
-
-                    if rule == "lower_better":
-                        good = -delta_pct
-                    elif rule == "higher_better":
-                        good = delta_pct
-                    elif rule == "cadence_stability":
-                        good = -abs(delta_pct)
-                    else:
-                        good = 0.0
-
-                    rows.append([label, float(v), float(b), float(delta_pct), float(good), rule])
-
-                if rows:
-                    comp = pd.DataFrame(rows, columns=["Mutató", "Utolsó", "Baseline", "Eltérés_%", "Jó_irány", "rule"])
-
-                    st.markdown("### 📈 Eltérések az easy baseline-hoz képest")
-                    figd = px.bar(
-                        comp.sort_values("Jó_irány"),
-                        x="Jó_irány",
-                        y="Mutató",
-                        orientation="h",
-                        hover_data=["Utolsó", "Baseline", "Eltérés_%", "rule"]
-                    )
-                    st.plotly_chart(figd, use_container_width=True)
-
-                    st.markdown("### 🚩 Gyors jelzések")
-                    msgs = []
-                    for _, r in comp.iterrows():
-                        if r["rule"] in ("lower_better", "higher_better"):
-                            if r["Jó_irány"] < -5:
-                                msgs.append(f"🔴 **{r['Mutató']}** romlott (≈ {r['Eltérés_%']:+.1f}%).")
-                            elif r["Jó_irány"] < -2:
-                                msgs.append(f"🟠 **{r['Mutató']}** kicsit romlott (≈ {r['Eltérés_%']:+.1f}%).")
-                            else:
-                                msgs.append(f"🟢 **{r['Mutató']}** rendben (≈ {r['Eltérés_%']:+.1f}%).")
-                        elif r["rule"] == "cadence_stability":
-                            if abs(r["Eltérés_%"]) > 5:
-                                msgs.append(f"🟠 **{r['Mutató']}** eltér a baseline-tól (≈ {r['Eltérés_%']:+.1f}%).")
-                            else:
-                                msgs.append(f"🟢 **{r['Mutató']}** stabil (≈ {r['Eltérés_%']:+.1f}%).")
-
-                    for m in msgs[:10]:
-                        st.write(m)
-
-                    with st.expander("📋 Részletes táblázat"):
-                        st.dataframe(comp.drop(columns=["Jó_irány"]), use_container_width=True, hide_index=True)
-                else:
-                    st.info("Nincs elég összehasonlítható metrika az utolsó futáshoz.")
+    with st.expander("📋 Részletes táblázat"):
+        st.dataframe(comp.drop(columns=["Jó_irány"]), use_container_width=True, hide_index=True)
 
 # -------------------------
 # WARNING TAB
