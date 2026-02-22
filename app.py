@@ -1367,8 +1367,29 @@ with tab_last:
             chosen_label = st.selectbox("Futás kiválasztása", options["__label"].tolist(), index=len(options)-1, key="pick_last")
             last = options.loc[options["__label"] == chosen_label].iloc[0]
 
+            # --- Baseline választás (Auto: run_type szerint / Mindig easy)
+        last_type = None
+        if run_type_col and run_type_col in base.columns and pd.notna(last.get(run_type_col)):
+            last_type = str(last.get(run_type_col)).strip().lower()
+
+        if baseline_mode == "Auto (Run_type szerint)" and last_type in ("easy", "tempo", "race"):
+            baseline_full = get_type_baseline(
+            base_df=base,
+            last_date=last["Dátum"],
+            run_type_col=run_type_col,
+            target_type=last_type,
+            weeks=baseline_weeks,
+         min_runs=baseline_min_runs
+             )
+            st.caption(f"Baseline: **{last_type}** futások (hetek: {baseline_weeks}, min: {baseline_min_runs})")
+        else:
             baseline_full = get_easy_baseline(
-            )
+            base_df=base,
+            last_date=last["Dátum"],
+            weeks=baseline_weeks,
+         min_runs=baseline_min_runs
+             )
+            st.caption(f"Baseline: **easy** futások (hetek: {baseline_weeks}, min: {baseline_min_runs})")
 
             # KPI-k
             c1, c2, c3, c4 = st.columns(4)
