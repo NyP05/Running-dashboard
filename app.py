@@ -160,6 +160,49 @@ def slope_bucket_row(up_m_per_km, down_m_per_km):
     if up >= 15 and down >= 15:
         return "hilly_mixed"
     return "other"
+def get_type_baseline(base_df, last_date, run_type_col, target_type,
+                      weeks=12, min_runs=25):
+    """
+    Baseline futások kiválasztása a target_type alapján.
+    1) Utolsó 'weeks' hét target_type futásai
+    2) Ha kevés: fallback a legutóbbi min_runs target_type futás
+    """
+    if base_df is None or len(base_df) == 0:
+        return pd.DataFrame()
+
+    if "Dátum" not in base_df.columns:
+        return pd.DataFrame()
+
+    dfb = base_df.copy()
+    dfb = dfb.dropna(subset=["Dátum"]).sort_values("Dátum")
+
+    # csak múltbeli futások (utolsó futásig)
+    dfb = dfb[dfb["Dátum"] <= last_date].copy()
+
+    # ha nincs run_type oszlop, nem tudunk szűrni → fallback: mindent visszaadunk (de ez ritka)
+    if not run_type_col or run_type_col not in dfb.columns:
+        # időablak
+        start = last_date - pd.Timedelta(weeks=weeks)
+        w = dfb[dfb["Dátum"] >= start].copy()
+        if len(w) < min_runs:
+            w = dfb.tail(min_runs).copy()
+        return w
+
+    # target_type szűrés
+    dfb[run_type_col] = dfb[run_type_col].astype(str).str.strip().str.lower()
+    t = str(target_type).strip().lower()
+
+    dfb = dfb[dfb[run_type_col] == t].copy()
+    if dfb.empty:
+        return pd.DataFrame()
+
+    start = last_date - pd.Timedelta(weeks=weeks)
+    w = dfb[dfb["Dátum"] >= start].copy()
+
+    if len(w) < min_runs:
+        w = dfb.tail(min_runs).copy()
+
+    return w
 
 def get_easy_baseline(base_df: pd.DataFrame, last_date: pd.Timestamp, weeks: int, min_runs: int) -> pd.DataFrame:
     if "Run_type" in base_df.columns:
@@ -726,6 +769,14 @@ if fatigue_col and d[fatigue_col].notna().sum() > 0:
 
 st.sidebar.divider()
 st.sidebar.header("Baseline (B-line)")
+
+baseline_mode = st.sidebar.selectbox(
+    "Baseline mód",
+    options=["Auto (Run_type szerint)", "Mindig EASY baseline"],
+    index=0,
+    help="Auto esetén: easy->easy baseline, tempo->tempo baseline, race->race baseline. "
+         "Mindig EASY: mindent easy futásokhoz hasonlít (régi működés)."
+)
 
 baseline_weeks = st.sidebar.slider(
     "Baseline ablak (hetek)", min_value=4, max_value=52, value=12, step=1,
@@ -1317,10 +1368,6 @@ with tab_last:
             last = options.loc[options["__label"] == chosen_label].iloc[0]
 
             baseline_full = get_easy_baseline(
-                base_df=base,
-                last_date=last["Dátum"],
-                weeks=baseline_weeks,
-                min_runs=baseline_min_runs
             )
 
             # KPI-k
