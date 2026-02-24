@@ -102,8 +102,11 @@ require_password()
 # 1) SEGÉDFÜGGVÉNYEK
 # =========================================================
 def to_float_series(s: pd.Series) -> pd.Series:
-    s = s.astype(str).str.strip()
-    s = s.replace({"--": np.nan, "": np.nan, "None": np.nan})
+    # If already numeric, avoid string accessor path entirely.
+    if pd.api.types.is_numeric_dtype(s):
+        return pd.to_numeric(s, errors="coerce")
+    s = s.astype("string").str.strip()
+    s = s.replace({"--": pd.NA, "": pd.NA, "None": pd.NA})
     s = s.str.replace(" ", "", regex=False)
     s = s.str.replace(",", ".", regex=False)  # HU tizedes -> pont
     return pd.to_numeric(s, errors="coerce")
