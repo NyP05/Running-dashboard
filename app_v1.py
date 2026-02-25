@@ -444,16 +444,22 @@ if date_candidates:
         .replace({"--": np.nan, "": np.nan, "None": np.nan})
     )
 
-    # 1️⃣ első próbálkozás: fix ISO formátum (CSV-dhez ez a jó)
+    # 1️⃣ első próbálkozás: fix ISO formátum
     dt = pd.to_datetime(
         s,
         errors="coerce",
         format="%Y-%m-%d %H:%M:%S"
     )
 
-    # 2️⃣ fallback: ha mégis eltérő formátum lenne
+    # 2️⃣ fallback: pandas automata felismerés
     if dt.notna().sum() == 0:
         dt = pd.to_datetime(s, errors="coerce")
+
+    # 3️⃣ fallback: Magyar formátum tisztítása (pl. "2023. 05. 12. 18:00")
+    if dt.notna().sum() == 0:
+        # Pontok és szóközök cseréje kötőjelre (2023. 05. 12. -> 2023-05-12)
+        s_clean = s.str.replace(r"\.\s*", "-", regex=True).str.strip("-")
+        dt = pd.to_datetime(s_clean, errors="coerce")
 
     df["Dátum"] = dt
 
