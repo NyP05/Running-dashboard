@@ -2,8 +2,9 @@ import io
 import numpy as np
 import pandas as pd
 import streamlit as st
-import plotly.express as px
 import csv
+import plotly.express as px
+import plotly.graph_objects as go
 import os
 from datetime import datetime
 
@@ -455,11 +456,15 @@ if date_candidates:
     if dt.notna().sum() == 0:
         dt = pd.to_datetime(s, errors="coerce")
 
-    # 3️⃣ fallback: Magyar formátum tisztítása (pl. "2023. 05. 12. 18:00")
+    # 3️⃣ fallback: Magyar formátum (YYYY. MM. DD. -> YYYY-MM-DD)
     if dt.notna().sum() == 0:
-        # Pontok és szóközök cseréje kötőjelre (2023. 05. 12. -> 2023-05-12)
-        s_clean = s.str.replace(r"\.\s*", "-", regex=True).str.strip("-")
+        # "2023. 05. 12. 18:00" -> "2023-05-12 18:00"
+        s_clean = s.str.replace(r"(\d{4})\.\s*(\d{1,2})\.\s*(\d{1,2})\.?", r"\1-\2-\3", regex=True)
         dt = pd.to_datetime(s_clean, errors="coerce")
+
+    # 4️⃣ fallback: dayfirst=True (pl. 12.05.2023 vagy 12/05/2023)
+    if dt.notna().sum() == 0:
+        dt = pd.to_datetime(s, dayfirst=True, errors="coerce")
 
     df["Dátum"] = dt
 
