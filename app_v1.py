@@ -184,14 +184,14 @@ def get_type_baseline(base_df, last_date, run_type_col, target_type,
 
     # ha nincs run_type oszlop, nem tudunk szűrni → fallback: mindent visszaadunk (de ez ritka)
     if not run_type_col or run_type_col not in dfb.columns:
-        # időablak
+        # idĹ‘ablak
         start = last_date - pd.Timedelta(weeks=weeks)
         w = dfb[dfb["Dátum"] >= start].copy()
         if len(w) < min_runs:
             w = dfb.tail(min_runs).copy()
         return w
 
-    # target_type szűrés
+    # target_type szĹ±rĂ©s
     dfb[run_type_col] = dfb[run_type_col].astype(str).str.strip().str.lower()
     t = str(target_type).strip().lower()
 
@@ -261,7 +261,7 @@ def daily_coach_summary(base_all: pd.DataFrame,
     last_easy = easy.iloc[-1]
     baseline_full = get_easy_baseline(
         base_df=b,
-        last_date=last_easy["Dátum"],
+        last_date=last_easy["DĂˇtum"],
         weeks=baseline_weeks,
         min_runs=baseline_min_runs
     )
@@ -329,8 +329,8 @@ def duration_to_seconds(x):
     if s in ("", "--", "None", "nan"):
         return np.nan
 
-    # tizedes levágás (00:00:27.7 -> 00:00:27)
-    s = s.replace(",", ".")  # ha valahol vessző van
+    # tizedes levĂˇgĂˇs (00:00:27.7 -> 00:00:27)
+    s = s.replace(",", ".")  # ha valahol vesszĹ‘ van
     s_main = s.split(".")[0]
 
     parts = s_main.split(":")
@@ -348,7 +348,7 @@ def duration_to_seconds(x):
     return np.nan
 def hr_zone_from_pct(pct: float) -> str:
     """
-    Egyszerű 5 zónás felosztás HRmax %-ból.
+    EgyszerĹ± 5 zĂłnĂˇs felosztĂˇs HRmax %-bĂłl.
     Z1: <60%
     Z2: 60-70%
     Z3: 70-80%
@@ -371,7 +371,7 @@ def hr_zone_from_pct(pct: float) -> str:
     
 
 # =========================================================
-# 2) BEOLVASÁS (upload-only)
+# 2) BEOLVASĂS (upload-only)
 # =========================================================
 st.sidebar.header("Adatforrás")
 uploaded = st.sidebar.file_uploader("Tölts fel Garmin exportot (XLSX ajánlott)", type=["xlsx", "csv"])
@@ -392,7 +392,7 @@ def load_any(file) -> pd.DataFrame:
     # ---- CSV (robosztus: csv.reader + encoding fallback)
     raw = file.getvalue()
 
-    # 1) encoding próbák (Garmin CSV néha nem utf-8)
+    # 1) encoding prĂłbĂˇk (Garmin CSV nĂ©ha nem utf-8)
     text = None
     for enc in ["utf-8-sig", "utf-8", "cp1250", "latin1"]:
         try:
@@ -407,7 +407,7 @@ def load_any(file) -> pd.DataFrame:
     if not lines:
         return pd.DataFrame()
 
-    # 2) header + sorok (idézőjeles CSV mezők biztonságos kezelése)
+    # 2) header + sorok (idĂ©zĹ‘jeles CSV mezĹ‘k biztonsĂˇgos kezelĂ©se)
     reader = csv.reader(io.StringIO(text), delimiter=",", quotechar='"')
     rows = list(reader)
     if not rows:
@@ -426,7 +426,7 @@ def load_any(file) -> pd.DataFrame:
 
     df = pd.DataFrame(data, columns=header)
 
-    # 3) oszlopnevek takarítása (BOM / whitespace)
+    # 3) oszlopnevek takarĂ­tĂˇsa (BOM / whitespace)
     df.columns = pd.Index(df.columns).astype(str).str.replace("\ufeff", "", regex=False).str.strip()
 
     return df
@@ -435,9 +435,9 @@ def load_any(file) -> pd.DataFrame:
 
 df0 = load_any(uploaded)
 def fix_mojibake_columns(df: pd.DataFrame) -> pd.DataFrame:
-    # Ha ilyen "DĂˇtum", "TevĂ©kenysĂ©g..." jellegű oszlopok vannak,
+    # Ha ilyen "DÄ‚Ë‡tum", "TevÄ‚Â©kenysÄ‚Â©g..." jellegű oszlopok vannak,
     # akkor valószínű latin1->utf8 félreértelmezés történt.
-    if any("Ă" in c for c in df.columns.astype(str)):
+    if any("Ä‚" in c for c in df.columns.astype(str)):
         new_cols = []
         for c in df.columns.astype(str):
             try:
@@ -469,30 +469,34 @@ if date_candidates:
 
     s = (
         df[date_col]
-        .astype(str)
+        .astype("string")
         .str.strip()
-        .replace({"--": np.nan, "": np.nan, "None": np.nan})
+        .replace({"--": pd.NA, "": pd.NA, "None": pd.NA, "nan": pd.NA})
     )
 
-    # 1️⃣ első próbálkozás: fix ISO formátum (CSV-dhez ez a jó)
-    dt = pd.to_datetime(
-        s,
-        errors="coerce",
-        format="%Y-%m-%d %H:%M:%S"
-    )
+    # 1) Quick ISO parse (common Garmin format)
+    dt = pd.to_datetime(s, errors="coerce", format="%Y-%m-%d %H:%M:%S")
 
-    # 2️⃣ fallback: ha mégis eltérő formátum lenne
-    if dt.notna().sum() == 0:
-        dt = pd.to_datetime(s, errors="coerce")
+    # 2) Generic parse for timezone strings (e.g. ...Z)
+    dt_utc = pd.to_datetime(s, errors="coerce", utc=True)
+    dt = dt.fillna(dt_utc.dt.tz_convert(None))
+
+    # 3) EU fallback (day-first)
+    dt_dayfirst = pd.to_datetime(s, errors="coerce", dayfirst=True, utc=True)
+    dt = dt.fillna(dt_dayfirst.dt.tz_convert(None))
+
+    # 4) Excel serial date fallback (numeric CSV exports)
+    num = pd.to_numeric(s.str.replace(",", ".", regex=False), errors="coerce")
+    dt_excel = pd.to_datetime(num, unit="D", origin="1899-12-30", errors="coerce")
+    dt = dt.fillna(dt_excel)
 
     df["Dátum"] = dt
 
+    if df["Dátum"].notna().sum() == 0:
+        st.error(f"A(z) '{date_col}' oszlopból nem sikerült dátumot értelmezni.")
+        st.stop()
 else:
     df["Dátum"] = pd.NaT
-
-
-
-
 
 if "Tevékenység típusa" in df.columns:
     mask_run = df["Tevékenység típusa"].astype(str).str.contains("Fut", na=False)
@@ -510,7 +514,6 @@ NUM_MAP = {
     "Teljes süllyedés": "des_m",
     "Távolság": "dist_km",
 }
-
 for src, dst in NUM_MAP.items():
     df[dst] = to_float_series(df[src]) if src in df.columns else np.nan
 
@@ -684,7 +687,7 @@ if len(fat) >= 20:
 st.title("🏃 Garmin Futás Dashboard")
 
 # -------------------------
-# Segédek (biztos, hogy vannak)
+# SegĂ©dek (biztos, hogy vannak)
 # -------------------------
 def num(v):
     return pd.to_numeric(
@@ -701,9 +704,9 @@ def med(series):
 # -------------------------
 # TABOK: Mobil / Desktop
 # -------------------------
-# Mobilon tabok, desktopon is ugyanaz (egységes UX)
+# Mobilon tabok, desktopon is ugyanaz (egysĂ©ges UX)
 tab_overview, tab_last, tab_warn, tab_ready, tab_data = st.tabs(
-    ["📌 Áttekintés", "🔎 Utolsó futás", "🚦 Warning", "🏁 Readiness", "📄 Adatok"]
+    ["📦 Áttekintés", "🔮 Utolsó futás", "🚦 Warning", "🏁 Readiness", "📑 Adatok"]
 )
 
 # -------------------------
@@ -791,7 +794,7 @@ baseline_mode = st.sidebar.selectbox(
     "Baseline mód",
     options=["Auto (Run_type szerint)", "Mindig EASY baseline"],
     index=0,
-    help="Auto esetén: easy->easy baseline, tempo->tempo baseline, race->race baseline. "
+    help="Auto esetĂ©n: easy->easy baseline, tempo->tempo baseline, race->race baseline. "
          "Mindig EASY: mindent easy futásokhoz hasonlít (régi működés)."
 )
 
@@ -833,9 +836,9 @@ with tab_overview:
     st.divider()
 
     # =========================================================
-    # 📊 Heti terhelés & ramp rate
+    # 📈 Heti terhelés & ramp rate
     # =========================================================
-    st.subheader("📊 Heti terhelés & ramp rate")
+    st.subheader("📈 Heti terhelés & ramp rate")
 
     base_all = d.copy()
     base_all = base_all[base_all["Dátum"].notna()].sort_values("Dátum")
@@ -1016,7 +1019,7 @@ with tab_overview:
         else:
             base_all["rt"] = "unknown"
 
-        # --- HR% és zóna
+        # --- HR% Ă©s zĂłna
         base_all["hr_pct"] = np.where(
             base_all["hr_avg"].notna() & (hrmax > 0),
             base_all["hr_avg"] / float(hrmax),
@@ -1097,7 +1100,7 @@ with tab_overview:
 
         # --- Kombinált “miért magas a fatigue?” nézet:
         # heti km + magas intenzitás arány (Z4+Z5)
-        st.markdown("#### 🔎 Terhelés vs Intenzitás (heti km + Z4/Z5 arány)")
+        st.markdown("#### 🔮 Terhelés vs Intenzitás (heti km + Z4/Z5 arány)")
 
         if hz_cols:
             hz_pivot["hi_intensity_pct"] = 0.0
@@ -1106,7 +1109,7 @@ with tab_overview:
             if "Z5" in hz_pivot.columns:
                 hz_pivot["hi_intensity_pct"] += hz_pivot["Z5"]
 
-            combo = weekly_km.rename(columns={"Dátum": "week"}).merge(
+            combo = weekly_km.rename(columns={"DĂˇtum": "week"}).merge(
                 hz_pivot[["week", "hi_intensity_pct"]], on="week", how="left"
             )
             combo["hi_intensity_pct"] = combo["hi_intensity_pct"].fillna(0.0)
@@ -1144,7 +1147,7 @@ with tab_overview:
     c1.metric("Futások (szűrve)", f"{len(view)}")
     c2.metric("Átlag Technika_index", f"{tech_avg:.1f}" if pd.notna(tech_avg) else "—")
     c3.metric("Átlag Fatigue_score", f"{fat_avg:.1f}" if pd.notna(fat_avg) else "—")
-    c4.metric("Leggyakoribb típus", most_type)
+    c4.metric("Leggyakoribb tĂ­pus", most_type)
 
     st.divider()
 
@@ -1357,14 +1360,14 @@ else:
 
                 st.plotly_chart(fig2, use_container_width=True)
 
-            st.caption("🔍 Minden pont egy hét: balról jobbra nő a terhelés, fentről lefelé romlik a technika.")
+            st.caption("🔭 Minden pont egy hét: balról jobbra nő a terhelés, fentről lefelé romlik a technika.")
 
 
 # -------------------------
 # UTOLSÓ FUTÁS: vizuális baseline összevetés + jelzések
 # -------------------------
 with tab_last:
-    st.subheader("🔎 Utolsó futás elemzése")
+    st.subheader("🔮 Utolsó futás elemzése")
 
     if "Technika_index" not in d.columns:
         st.info("Nincs Technika_index – az utolsó futás technika elemzéséhez számított index kell.")
@@ -1533,7 +1536,7 @@ with tab_warn:
     st.subheader("🚦 Warning rendszer (easy futások alapján)")
 
     if "Technika_index" not in d.columns or fatigue_col is None:
-        st.info("Warning-hoz kell Technika_index és Fatigue_score.")
+        st.info("Warning-hoz kell Technika_index Ă©s Fatigue_score.")
     else:
         with st.expander("Beállítások", expanded=False):
             colA, colB, colC = st.columns(3)
@@ -1701,10 +1704,10 @@ with tab_ready:
                     st.dataframe(w.sort_values("Dátum", ascending=False)[show_cols], use_container_width=True, hide_index=True)
 
 # -------------------------
-# ADATOK TAB (táblázat csak itt)
+# ADATOK TAB (tĂˇblĂˇzat csak itt)
 # -------------------------
 with tab_data:
-    st.subheader("📄 Adatok (szűrve)")
+    st.subheader("📑 Adatok (szűrve)")
     st.caption("Itt vannak a részletes táblázatok – az elemzésekhez elég az első 4 tab.")
     st.dataframe(view, use_container_width=True, hide_index=True, height=520)
 
