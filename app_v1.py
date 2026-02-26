@@ -431,14 +431,18 @@ def _parse_date_series(s) -> pd.Series:
     # Duplikált oszlopnévnél df[c] DataFrame lehet, ezt egyetlen sorozattá lapítjuk.
     if isinstance(s, pd.DataFrame):
         s = s.bfill(axis=1).iloc[:, 0]
+    elif isinstance(s, pd.Index):
+        s = pd.Series(s)
     elif not isinstance(s, pd.Series):
-        s = pd.Series(s, index=df.index)
+        s = pd.Series(s)
 
-    s = s.astype(str).str.strip().replace({"--": np.nan, "": np.nan, "None": np.nan, "nan": np.nan})
+    # .str accessor helyett elemenkénti normalizálás, hogy ne tudjon AttributeError-t dobni.
+    s = s.map(lambda x: None if pd.isna(x) else str(x).strip())
+    s = s.replace({"--": np.nan, "": np.nan, "None": np.nan, "nan": np.nan})
     attempts = []
     attempts.append(pd.to_datetime(s, errors="coerce", format="%Y-%m-%d %H:%M:%S"))
     attempts.append(pd.to_datetime(s, errors="coerce"))
-    s_clean = s.str.replace(r"(\d{4})\.\s*(\d{1,2})\.\s*(\d{1,2})\.?", r"\1-\2-\3", regex=True)
+    s_clean = s.replace(r"(\d{4})\.\s*(\d{1,2})\.\s*(\d{1,2})\.?", r"\1-\2-\3", regex=True)
     attempts.append(pd.to_datetime(s_clean, errors="coerce"))
     attempts.append(pd.to_datetime(s, dayfirst=True, errors="coerce"))
 
