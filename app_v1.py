@@ -427,7 +427,13 @@ date_candidates = [
 if not date_candidates:
     date_candidates = list(df.columns)
 
-def _parse_date_series(s: pd.Series) -> pd.Series:
+def _parse_date_series(s) -> pd.Series:
+    # Duplikált oszlopnévnél df[c] DataFrame lehet, ezt egyetlen sorozattá lapítjuk.
+    if isinstance(s, pd.DataFrame):
+        s = s.bfill(axis=1).iloc[:, 0]
+    elif not isinstance(s, pd.Series):
+        s = pd.Series(s, index=df.index)
+
     s = s.astype(str).str.strip().replace({"--": np.nan, "": np.nan, "None": np.nan, "nan": np.nan})
     attempts = []
     attempts.append(pd.to_datetime(s, errors="coerce", format="%Y-%m-%d %H:%M:%S"))
