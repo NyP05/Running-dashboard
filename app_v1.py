@@ -422,44 +422,43 @@ df = df0.copy()
 # --- Dátum oszlop felderítés + parse (CSV-hez is)
 date_candidates = [
     c for c in df.columns
-    if "dátum" in c.lower() or "datum" in c.lower() or "date" in c.lower()
+    if any(k in c.lower() for k in ["dátum", "datum", "date", "időpont", "time", "start"])
 ]
+if not date_candidates:
+    date_candidates = list(df.columns)
 
-if date_candidates:
-    date_col = date_candidates[0]
+def _parse_date_series(s: pd.Series) -> pd.Series:
+    s = s.astype(str).str.strip().replace({"--": np.nan, "": np.nan, "None": np.nan, "nan": np.nan})
+    attempts = []
+    attempts.append(pd.to_datetime(s, errors="coerce", format="%Y-%m-%d %H:%M:%S"))
+    attempts.append(pd.to_datetime(s, errors="coerce"))
+    s_clean = s.str.replace(r"(\d{4})\.\s*(\d{1,2})\.\s*(\d{1,2})\.?", r"\1-\2-\3", regex=True)
+    attempts.append(pd.to_datetime(s_clean, errors="coerce"))
+    attempts.append(pd.to_datetime(s, dayfirst=True, errors="coerce"))
 
-    s = (
-        df[date_col]
-        .astype(str)
-        .str.strip()
-        .replace({"--": np.nan, "": np.nan, "None": np.nan})
-    )
+    best = attempts[0]
+    best_score = int(best.notna().sum())
+    for cand in attempts[1:]:
+        score = int(cand.notna().sum())
+        if score > best_score:
+            best = cand
+            best_score = score
+    return best
 
-    # 1️⃣ első próbálkozás: fix ISO formátum
-    dt = pd.to_datetime(
-        s,
-        errors="coerce",
-        format="%Y-%m-%d %H:%M:%S"
-    )
+best_col = None
+best_dt = pd.Series(pd.NaT, index=df.index)
+best_score = -1
+for c in date_candidates:
+    dt_try = _parse_date_series(df[c])
+    score = int(dt_try.notna().sum())
+    if score > best_score:
+        best_score = score
+        best_dt = dt_try
+        best_col = c
 
-    # 2️⃣ fallback: pandas automata felismerés
-    if dt.notna().sum() == 0:
-        dt = pd.to_datetime(s, errors="coerce")
-
-    # 3️⃣ fallback: Magyar formátum (YYYY. MM. DD. -> YYYY-MM-DD)
-    if dt.notna().sum() == 0:
-        # "2023. 05. 12. 18:00" -> "2023-05-12 18:00"
-        s_clean = s.str.replace(r"(\d{4})\.\s*(\d{1,2})\.\s*(\d{1,2})\.?", r"\1-\2-\3", regex=True)
-        dt = pd.to_datetime(s_clean, errors="coerce")
-
-    # 4️⃣ fallback: dayfirst=True (pl. 12.05.2023 vagy 12/05/2023)
-    if dt.notna().sum() == 0:
-        dt = pd.to_datetime(s, dayfirst=True, errors="coerce")
-
-    df["Dátum"] = dt
-
-else:
-    df["Dátum"] = pd.NaT
+df["Dátum"] = best_dt
+if best_score > 0:
+    st.sidebar.caption(f"Dátum oszlop: {best_col} ({best_score} érvényes sor)")
 
 
 
