@@ -2,6 +2,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 import plotly.express as px
+import csv
 
 st.set_page_config(page_title="Garmin Futás Dashboard", layout="wide")
 # =========================================================
@@ -371,46 +372,67 @@ if uploaded is None:
 
 @st.cache_data(show_spinner=False)
 def load_any(file) -> pd.DataFrame:
-    """Robusztusan beolvas egy feltöltött fájlt (XLSX vagy CSV)."""
     name = getattr(file, "name", "").lower()
 
+    # ---- XLSX
     if name.endswith(".xlsx"):
-        try:
-            return pd.read_excel(file, engine="openpyxl")
-        except Exception as e:
-            st.error(f"Hiba az XLSX fájl olvasása közben: {e}")
-            return pd.DataFrame()
+        return pd.read_excel(file, engine="openpyxl")
 
-    if name.endswith(".csv"):
-        # A fájlobjektum pointerét visszaállítjuk, hogy többször olvasható legyen
-        file.seek(0)
-        
-        # Gyakori kódolások kipróbálása
-        for enc in ["utf-8", "utf-8-sig", "cp1250", "latin1"]:
-            try:
-                file.seek(0)
-                df = pd.read_csv(file, encoding=enc)
-                # Heurisztika: ha a hibásan dekódolt karakterek jelen vannak,
-                # akkor ez a kódolás rossz volt, próbáljuk a következőt.
-                if any("Ă" in str(c) for c in df.columns):
-                    continue
-                return df
-            except (UnicodeDecodeError, pd.errors.ParserError):
-                continue
-        
-        # Végső fallback, ha semmi sem működött
-        try:
-            file.seek(0)
-            st.warning("Nem sikerült automatikusan felismerni a CSV kódolását, UTF-8 (replace) móddal próbálkozom.")
-            return pd.read_csv(file, encoding="utf-8", encoding_errors="replace")
-        except Exception as e:
-            st.error(f"Nem sikerült beolvasni a CSV fájlt. Hiba: {e}")
-            return pd.DataFrame()
+    # ---- CSV (robosztus: csv.reader + encoding fallback)
+    raw = file.getvalue()
 
-    st.error("Ismeretlen fájltípus. Kérlek, XLSX vagy CSV fájlt tölts fel.")
-    return pd.DataFrame()
+    # 1) encoding próbák (Garmin CSV néha nem utf-8)
+    text = None
+    for enc in ["utf-8-sig", "utf-8", "cp1250", "latin1"]:
+        try:
+            text = raw.decode(enc)
+            break
+        except:
+            continue
+    if text is None:
+        text = raw.decode("utf-8", errors="replace")
+
+    lines = text.strip().splitlines()
+    if not lines:
+        return pd.DataFrame()
+
+    # 2) header + sorok (a te scripted logikád)
+    header = lines[0].split(",")
+    data_lines = lines[1:]
+
+    data = []
+    for raw_data in data_lines:
+        raw_data = raw_data.replace('""', '"')
+        if raw_data.startswith('"'):
+            raw_data = raw_data[1:]
+        reader = csv.reader([raw_data], delimiter=",", quotechar='"')
+        row = next(reader)
+        data.append(row)
+
+    df = pd.DataFrame(data, columns=header)
+
+    # 3) oszlopnevek takarítása (BOM / whitespace)
+    df.columns = pd.Index(df.columns).astype(str).str.replace("\ufeff", "", regex=False).str.strip()
+
+    return df
 
 df0 = load_any(uploaded)
+def fix_mojibake_columns(df: pd.DataFrame) -> pd.DataFrame:
+    # Ha ilyen "DĂˇtum", "TevĂ©kenysĂ©g..." jellegű oszlopok vannak,
+    # akkor valószínű latin1->utf8 félreértelmezés történt.
+    if any("Ă" in c for c in df.columns.astype(str)):
+        new_cols = []
+        for c in df.columns.astype(str):
+            try:
+                new_cols.append(c.encode("latin1").decode("utf-8"))
+            except Exception:
+                new_cols.append(c)
+        df = df.copy()
+        df.columns = new_cols
+    return df
+
+df0 = fix_mojibake_columns(df0)
+
 df = df0.copy()
 
 # =========================================================
@@ -422,57 +444,34 @@ df = df0.copy()
 # --- Dátum oszlop felderítés + parse (CSV-hez is)
 date_candidates = [
     c for c in df.columns
-    if any(k in c.lower() for k in ["dátum", "datum", "date", "időpont", "time", "start"])
+    if "dátum" in c.lower() or "datum" in c.lower() or "date" in c.lower()
 ]
-if not date_candidates:
-    date_candidates = list(df.columns)
 
-def _parse_date_series(s) -> pd.Series:
-    # Duplikált oszlopnévnél df[c] DataFrame lehet, ezt egyetlen sorozattá lapítjuk.
-    if isinstance(s, pd.DataFrame):
-        s = s.bfill(axis=1).iloc[:, 0]
-    elif isinstance(s, pd.Index):
-        s = pd.Series(s)
-    elif not isinstance(s, pd.Series):
-        s = pd.Series(s)
+if date_candidates:
+    date_col = date_candidates[0]
 
-    # .str accessor helyett elemenkénti normalizálás, hogy ne tudjon AttributeError-t dobni.
-    s = s.map(lambda x: None if pd.isna(x) else str(x).strip())
-    s = s.replace({"--": np.nan, "": np.nan, "None": np.nan, "nan": np.nan})
-    attempts = []
-    attempts.append(pd.to_datetime(s, errors="coerce", format="%Y-%m-%d %H:%M:%S"))
-    attempts.append(pd.to_datetime(s, errors="coerce"))
-    s_clean = s.replace(r"(\d{4})\.\s*(\d{1,2})\.\s*(\d{1,2})\.?", r"\1-\2-\3", regex=True)
-    attempts.append(pd.to_datetime(s_clean, errors="coerce"))
-    attempts.append(pd.to_datetime(s, dayfirst=True, errors="coerce"))
+    s = (
+        df[date_col]
+        .astype(str)
+        .str.strip()
+        .replace({"--": np.nan, "": np.nan, "None": np.nan})
+    )
 
-    best = attempts[0]
-    best_score = int(best.notna().sum())
-    for cand in attempts[1:]:
-        score = int(cand.notna().sum())
-        if score > best_score:
-            best = cand
-            best_score = score
-    return best
+    # 1️⃣ első próbálkozás: fix ISO formátum (CSV-dhez ez a jó)
+    dt = pd.to_datetime(
+        s,
+        errors="coerce",
+        format="%Y-%m-%d %H:%M:%S"
+    )
 
-best_col = None
-best_dt = pd.Series(pd.NaT, index=df.index)
-best_score = -1
-for c in date_candidates:
-    dt_try = _parse_date_series(df[c])
-    score = int(dt_try.notna().sum())
-    if score > best_score:
-        best_score = score
-        best_dt = dt_try
-        best_col = c
+    # 2️⃣ fallback: ha mégis eltérő formátum lenne
+    if dt.notna().sum() == 0:
+        dt = pd.to_datetime(s, errors="coerce")
 
-df["Dátum"] = best_dt
-if best_score > 0:
-    st.sidebar.caption(f"Dátum oszlop: {best_col} ({best_score} érvényes sor)")
+    df["Dátum"] = dt
 
-
-
-
+else:
+    df["Dátum"] = pd.NaT
 
 if "Tevékenység típusa" in df.columns:
     mask_run = df["Tevékenység típusa"].astype(str).str.contains("Fut", na=False)
@@ -744,9 +743,14 @@ if pd.isna(min_date) or pd.isna(max_date):
     st.stop()
 
 date_from, date_to = st.sidebar.date_input(
+dt_input = st.sidebar.date_input(
     "Dátumtartomány",
     value=(min_date.date(), max_date.date()),
 )
+if len(dt_input) == 2:
+    date_from, date_to = dt_input
+else:
+    date_from, date_to = dt_input[0], dt_input[0]
 
 mask = (d["Dátum"].dt.date >= date_from) & (d["Dátum"].dt.date <= date_to)
 
