@@ -839,22 +839,19 @@ with tab_overview:
     st.subheader("🗓️ Napi összkép (coach)")
 
     # daily_coach_summary opcionális – ha nincs definiálva, ne dőljön össze
-    if "daily_coach_summary" in globals():
-        status, msg = daily_coach_summary(
-            base_all=d,
-            run_type_col=run_type_col,
-            fatigue_col=fatigue_col,
-            baseline_weeks=baseline_weeks,
-            baseline_min_runs=baseline_min_runs
-        )
-        if status == "🔴":
-            st.error(f"{status} {msg}")
-        elif status == "🟠":
-            st.warning(f"{status} {msg}")
-        else:
-            st.success(f"{status} {msg}")
+    status, msg = daily_coach_summary(
+        base_all=d,
+        run_type_col=run_type_col,
+        fatigue_col=fatigue_col,
+        baseline_weeks=baseline_weeks,
+        baseline_min_runs=baseline_min_runs
+    )
+    if status == "🔴":
+        st.error(f"{status} {msg}")
+    elif status == "🟠":
+        st.warning(f"{status} {msg}")
     else:
-        st.info("ℹ️ (Opció) daily_coach_summary nincs bekötve – csak a grafikonok/KPI futnak.")
+        st.success(f"{status} {msg}")
 
     st.divider()
 
@@ -866,19 +863,8 @@ with tab_overview:
     base_all = d.copy()
     base_all = base_all[base_all["Dátum"].notna()].sort_values("Dátum")
 
-    # --- távolság km
-    if "dist_km" not in base_all.columns:
-        if "Távolság" in base_all.columns:
-            base_all["dist_km"] = to_float_series(base_all["Távolság"])
-        else:
-            base_all["dist_km"] = np.nan
-
-    # --- emelkedés m
-    if "asc_m" not in base_all.columns:
-        if "Teljes emelkedés" in base_all.columns:
-            base_all["asc_m"] = to_float_series(base_all["Teljes emelkedés"])
-        else:
-            base_all["asc_m"] = np.nan
+    # Megjegyzés: A dist_km és asc_m oszlopok már létrejöttek a 3) NORMALIZÁLÁS lépésben (NUM_MAP),
+    # így itt nem kell őket újra ellenőrizni/létrehozni.
 
     # --- idő sec (Idő / Menetidő / Eltelt idő)
     time_col_candidates = [c for c in ["Idő", "Menetidő", "Eltelt idő"] if c in base_all.columns]
@@ -1003,6 +989,53 @@ with tab_overview:
 
     with st.expander("📋 Heti táblázat (részletek)"):
         st.dataframe(weekly.tail(24), use_container_width=True, hide_index=True)
+
+    # =========================================================
+    # 📅 Éves aktivitás (naptár)
+    # =========================================================
+    st.divider()
+    st.subheader("📅 Éves aktivitás (naptár)")
+
+    if "Dátum" in d.columns and "dist_km" in d.columns:
+        cal_df = d.dropna(subset=["Dátum"]).copy()
+        cal_df["year"] = cal_df["Dátum"].dt.year
+        cal_df["week"] = cal_df["Dátum"].dt.isocalendar().week
+        cal_df["dow"] = cal_df["Dátum"].dt.dayofweek  # 0=Mon, 6=Sun
+
+        available_years = sorted(cal_df["year"].unique(), reverse=True)
+        if available_years:
+            sel_year = st.selectbox("Válassz évet", available_years, index=0, key="cal_year_select")
+
+            df_y = cal_df[cal_df["year"] == sel_year].copy()
+            
+            # Napi aggregálás (ha több futás lenne egy nap)
+            daily_sums = df_y.groupby(["week", "dow"])["dist_km"].sum().reset_index()
+
+            # Pivot: sor=Nap, oszlop=Hét
+            heatmap_data = daily_sums.pivot(index="dow", columns="week", values="dist_km").fillna(0)
+
+            # Rács kiegészítése (0-6 nap, 1-53 hét)
+            heatmap_data = heatmap_data.reindex(index=range(7), fill_value=0)
+            heatmap_data = heatmap_data.reindex(columns=range(1, 54), fill_value=0)
+
+            days_hu = ["Hétfő", "Kedd", "Szerda", "Csütörtök", "Péntek", "Szombat", "Vasárnap"]
+
+            fig_cal = px.imshow(
+                heatmap_data,
+                labels=dict(x="Hét", y="Nap", color="km"),
+                x=heatmap_data.columns,
+                y=days_hu,
+                color_continuous_scale="Greens",
+                aspect="auto",
+                title=f"{sel_year} – Futott km naponta"
+            )
+            fig_cal.update_xaxes(side="top", dtick=2)
+            fig_cal.update_layout(height=300, margin=dict(l=0, r=0, t=50, b=0))
+            fig_cal.update_traces(xgap=2, ygap=2)
+            st.plotly_chart(fig_cal, use_container_width=True)
+        else:
+            st.info("Nincs elérhető év adat.")
+
     # =========================================================
     # ⚡ Intenzitás megoszlás heti szinten
     # easy/tempo/race arány + HR zónák
