@@ -742,7 +742,6 @@ if pd.isna(min_date) or pd.isna(max_date):
     st.sidebar.error("Nem sikerült dátumtartományt képezni (NaT).")
     st.stop()
 
-date_from, date_to = st.sidebar.date_input(
 dt_input = st.sidebar.date_input(
     "Dátumtartomány",
     value=(min_date.date(), max_date.date()),
