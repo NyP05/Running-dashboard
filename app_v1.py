@@ -357,6 +357,27 @@ def hr_zone_from_pct(pct: float) -> str:
         return "Z4"
     return "Z5"
 
+def run_type_hu(x):
+    mapping = {"easy": "Könnyű", "tempo": "Tempó", "race": "Verseny"}
+    if pd.isna(x):
+        return np.nan
+    s = str(x).strip().lower()
+    return mapping.get(s, s)
+
+def slope_bucket_hu(x):
+    mapping = {
+        "flat": "Sík",
+        "rolling": "Hullámos",
+        "uphill_dominant": "Emelkedő domináns",
+        "downhill_dominant": "Lejtő domináns",
+        "hilly_mixed": "Dombos vegyes",
+        "other": "Egyéb",
+    }
+    if pd.isna(x):
+        return np.nan
+    s = str(x).strip()
+    return mapping.get(s, s)
+
     
 
 # =========================================================
@@ -709,6 +730,11 @@ fatigue_col = safe_col(d, "Fatigue_score")
 fatigue_type_col = safe_col(d, "Fatigue_type")
 slope_col = safe_col(d, "slope_bucket")
 
+if run_type_col:
+    d["Edzés típusa"] = d[run_type_col].apply(run_type_hu)
+if slope_col:
+    d["Terep"] = d[slope_col].apply(slope_bucket_hu)
+
 # -------------------------
 # Sidebar: Szűrők + Baseline
 # -------------------------
@@ -756,13 +782,23 @@ mask = (d["Dátum"].dt.date >= date_from) & (d["Dátum"].dt.date <= date_to)
 if run_type_col:
     types = ["easy", "tempo", "race"]
     present = [t for t in types if t in set(d[run_type_col].dropna().astype(str))]
-    selected_types = st.sidebar.multiselect("Run_type", options=present, default=present)
+    selected_types = st.sidebar.multiselect(
+        "Edzés típusa",
+        options=present,
+        default=present,
+        format_func=run_type_hu
+    )
     if selected_types:
         mask &= d[run_type_col].isin(selected_types)
 
 if slope_col:
     slope_opts = [x for x in d[slope_col].dropna().unique().tolist()]
-    slope_sel = st.sidebar.multiselect("Terep (slope_bucket)", options=slope_opts, default=slope_opts)
+    slope_sel = st.sidebar.multiselect(
+        "Terep",
+        options=slope_opts,
+        default=slope_opts,
+        format_func=slope_bucket_hu
+    )
     if slope_sel:
         mask &= d[slope_col].isin(slope_sel)
 
@@ -779,7 +815,7 @@ st.sidebar.header("Baseline (B-line)")
 
 baseline_mode = st.sidebar.selectbox(
     "Baseline mód",
-    options=["Auto (Run_type szerint)", "Mindig EASY baseline"],
+    options=["Auto (Edzés típusa szerint)", "Mindig EASY baseline"],
     index=0,
     help="Auto esetén: easy->easy baseline, tempo->tempo baseline, race->race baseline. "
          "Mindig EASY: mindent easy futásokhoz hasonlít (régi működés)."
@@ -1054,18 +1090,19 @@ with tab_overview:
             st.markdown("#### 🧩 Easy / Tempo / Race arány (heti %)")
             if run_type_col and (("easy" in rt_cols) or ("tempo" in rt_cols) or ("race" in rt_cols)):
                 show_rts = [c for c in ["easy", "tempo", "race"] if c in rt_cols]
-                rt_long = rt_pivot[["week"] + show_rts].melt("week", var_name="Run_type", value_name="Percent")
+                rt_long = rt_pivot[["week"] + show_rts].melt("week", var_name="Edzés típusa", value_name="Percent")
+                rt_long["Edzés típusa"] = rt_long["Edzés típusa"].apply(run_type_hu)
                 fig_rt = px.bar(
                     rt_long,
                     x="week",
                     y="Percent",
-                    color="Run_type",
+                    color="Edzés típusa",
                     barmode="stack",
                     labels={"week": "Hét", "Percent": "%"},
                 )
                 st.plotly_chart(fig_rt, use_container_width=True)
             else:
-                st.info("Run_type hiányzik / nincs felismerve (easy/tempo/race).")
+                st.info("Edzés típus hiányzik / nincs felismerve (easy/tempo/race).")
 
         with cR:
             st.markdown("#### ❤️ HR zóna megoszlás (heti %)")
@@ -1128,13 +1165,13 @@ with tab_overview:
     # KPI-k (ha nincs technika/fatigue, akkor is menjen)
     tech_avg = view["Technika_index"].mean() if ("Technika_index" in view.columns and view["Technika_index"].notna().any()) else np.nan
     fat_avg = view[fatigue_col].mean() if (fatigue_col and view[fatigue_col].notna().any()) else np.nan
-    most_type = view[run_type_col].value_counts().index[0] if (run_type_col and len(view) > 0) else "—"
+    most_type = run_type_hu(view[run_type_col].value_counts().index[0]) if (run_type_col and len(view) > 0) else "—"
 
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Futások (szűrve)", f"{len(view)}")
     c2.metric("Átlag Technika_index", f"{tech_avg:.1f}" if pd.notna(tech_avg) else "—")
     c3.metric("Átlag Fatigue_score", f"{fat_avg:.1f}" if pd.notna(fat_avg) else "—")
-    c4.metric("Leggyakoribb típus", most_type)
+    c4.metric("Leggyakoribb edzés típus", most_type)
 
     st.divider()
 
@@ -1148,9 +1185,9 @@ with tab_overview:
                 view.dropna(subset=["Technika_index"]),
                 x="Dátum",
                 y="Technika_index",
-                color=run_type_col if run_type_col else None,
-                symbol=slope_col if slope_col else None,
-                hover_data=[c for c in ["Cím", "Átlagos tempó", fatigue_col, fatigue_type_col, slope_col] if c and c in view.columns],
+                color="Edzés típusa" if "Edzés típusa" in view.columns else None,
+                symbol="Terep" if "Terep" in view.columns else None,
+                hover_data=[c for c in ["Cím", "Átlagos tempó", fatigue_col, fatigue_type_col, "Terep"] if c and c in view.columns],
                 opacity=0.75,
             )
             view2 = view[["Dátum", "Technika_index"]].dropna().sort_values("Dátum").copy()
@@ -1166,9 +1203,9 @@ with tab_overview:
     with right:
         st.subheader("🗺️ Terep megoszlás (szűrve)")
         if slope_col and len(view[slope_col].dropna()) > 0:
-            cnt = view[slope_col].value_counts().reset_index()
-            cnt.columns = ["slope_bucket", "db"]
-            st.plotly_chart(px.bar(cnt, x="slope_bucket", y="db"), use_container_width=True)
+            cnt = view[slope_col].apply(slope_bucket_hu).value_counts().reset_index()
+            cnt.columns = ["Terep", "db"]
+            st.plotly_chart(px.bar(cnt, x="Terep", y="db"), use_container_width=True)
         else:
             st.info("Nincs slope_bucket adat.")
 
@@ -1187,9 +1224,9 @@ with tab_overview:
                 dd,
                 x="Technika_index",
                 y=fatigue_col,
-                color=run_type_col if run_type_col else None,
-                symbol=slope_col if slope_col else None,
-                hover_data=[c for c in ["Dátum", "Cím", "Átlagos tempó", fatigue_type_col, slope_col] if c and c in dd.columns],
+                color="Edzés típusa" if "Edzés típusa" in dd.columns else None,
+                symbol="Terep" if "Terep" in dd.columns else None,
+                hover_data=[c for c in ["Dátum", "Cím", "Átlagos tempó", fatigue_type_col, "Terep"] if c and c in dd.columns],
                 opacity=0.75
             )
             fig2.add_vline(x=tech_med)
@@ -1372,7 +1409,7 @@ with tab_last:
 
         def label_row(r):
             title = r["Cím"] if "Cím" in options.columns and pd.notna(r.get("Cím")) else ""
-            rt = r["Run_type"] if "Run_type" in options.columns and pd.notna(r.get("Run_type")) else ""
+            rt = run_type_hu(r["Run_type"]) if "Run_type" in options.columns and pd.notna(r.get("Run_type")) else ""
             return f"{r['Dátum'].strftime('%Y-%m-%d %H:%M')} | {rt} | {title}"[:120]
 
         options["__label"] = options.apply(label_row, axis=1)
@@ -1390,7 +1427,7 @@ with tab_last:
             last_type = str(last.get(run_type_col)).strip().lower()
 
         # --- Baseline választás (Auto: run_type szerint / Mindig easy)
-        if baseline_mode == "Auto (Run_type szerint)" and last_type in ("easy", "tempo", "race"):
+        if baseline_mode == "Auto (Edzés típusa szerint)" and last_type in ("easy", "tempo", "race"):
             baseline_full = get_type_baseline(
                 base_df=base,
                 last_date=last["Dátum"],
@@ -1418,7 +1455,7 @@ with tab_last:
         fat_val = last.get("Fatigue_score")
         c2.metric("Fatigue_score", f"{float(fat_val):.1f}" if pd.notna(fat_val) else "—")
 
-        c3.metric("Run_type", str(last.get("Run_type")) if pd.notna(last.get("Run_type")) else "—")
+        c3.metric("Edzés típusa", run_type_hu(last.get("Run_type")) if pd.notna(last.get("Run_type")) else "—")
 
         pace = last.get("Átlagos tempó") if "Átlagos tempó" in base.columns else None
         dist = last.get("Távolság") if "Távolság" in base.columns else None
@@ -1438,7 +1475,7 @@ with tab_last:
             # DEBUG: miért üres?
             if "Run_type" in base.columns:
                 cnts = base["Run_type"].value_counts(dropna=False).head(10)
-                st.write("DEBUG Run_type megoszlás (utolsó 60 technikás futásból):")
+                st.write("DEBUG Edzés típus megoszlás (utolsó 60 technikás futásból):")
                 st.dataframe(cnts.rename("db").reset_index().rename(columns={"index": "Run_type"}), hide_index=True)
 
                 st.write("DEBUG last_type:", last_type)
@@ -1613,7 +1650,7 @@ with tab_ready:
     st.subheader("🏁 Verseny-előrejelzés (Readiness) – 14 napos ablak")
 
     if run_type_col is None or fatigue_col is None or "Technika_index" not in d.columns:
-        st.info("Readiness-hez kell Run_type + Fatigue_score + Technika_index.")
+        st.info("Readiness-hez kell Edzés típusa + Fatigue_score + Technika_index.")
     else:
         base_all = d.dropna(subset=["Dátum", "Technika_index"]).sort_values("Dátum")
         easy = base_all[base_all[run_type_col] == "easy"].dropna(subset=[fatigue_col]).copy()
