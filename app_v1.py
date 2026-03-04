@@ -689,6 +689,133 @@ if len(fat) >= 20:
 # 8) DASHBOARD (UX: kevesebb táblázat, több vizuál)
 # =========================================================
 st.title("🏃 Garmin Futás Dashboard")
+# =========================================================
+# 9) RUNNING ECONOMY SCORE (RES+) — power + temp + slope-aware baseline
+#    Power oszlopok: "Átl. teljesítmény" és "Max. teljesítmény"
+# =========================================================
+
+# 1) Power beolvasás (CSV oszlopnevek szerint)
+df["power_avg_w"] = to_float_series(df["Átl. teljesítmény"]) if "Átl. teljesítmény" in df.columns else np.nan
+df["power_max_w"] = to_float_series(df["Max. teljesítmény"]) if "Max. teljesítmény" in df.columns else np.nan
+
+# 2) Temperature (ha van)
+temp_candidates = ["Hőmérséklet", "Temperature", "Temp", "Átlag hőmérséklet", "Avg Temperature"]
+temp_col = next((c for c in temp_candidates if c in df.columns), None)
+df["temp_c"] = to_float_series(df[temp_col]) if temp_col else np.nan
+
+# 3) HR átlag (nálad hr_num már számolva van)
+df["hr_avg"] = df["hr_num"] if "hr_num" in df.columns else np.nan
+
+# 4) Költség mutatók (minél kisebb, annál jobb)
+# cardio: HR/W (alacsonyabb = gazdaságosabb)
+df["hr_per_watt"] = np.where(
+    df["hr_avg"].notna() & df["power_avg_w"].notna() & (df["power_avg_w"] > 0),
+    df["hr_avg"] / df["power_avg_w"],
+    np.nan
+)
+
+# mechanical: W per speed (alacsonyabb = kevesebb watt kell ugyanarra a sebességre)
+df["power_per_speed"] = np.where(
+    df["power_avg_w"].notna() & df["speed_mps"].notna() & (df["speed_mps"] > 0),
+    df["power_avg_w"] / df["speed_mps"],
+    np.nan
+)
+
+# 5) Temperature bin baseline-hoz (stabil, kevés adatnál is oké)
+def temp_bin(t):
+    if pd.isna(t): return "unk"
+    t = float(t)
+    if t < 10: return "cold"
+    if t < 18: return "cool"
+    if t < 24: return "mild"
+    return "hot"
+
+df["temp_bin"] = df["temp_c"].apply(temp_bin)
+
+# 6) RES+ számítás: speed_bin + slope_bucket + temp_bin baseline (robust z)
+df["RES_plus"] = np.nan
+df["Power_fatigue_hint"] = np.nan  # opcionális: jelzi, ha átlag powerhez képest csúcsos volt
+
+eco = df[mask_run].copy()
+eco = eco.dropna(subset=["Dátum", "speed_mps"])
+
+if len(eco) >= 25:
+    eco["speed_bin"] = pd.qcut(eco["speed_mps"], q=8, duplicates="drop")
+    group_cols = ["speed_bin", "slope_bucket", "temp_bin"]
+
+    # komponensek (mind "minél nagyobb = jobb")
+    for c in ["eco_hrpw", "eco_pps", "eco_gct", "eco_vr", "eco_vo", "eco_cad", "eco_stride"]:
+        eco[c] = np.nan
+
+    def fill_group(g: pd.DataFrame):
+        idx = g.index
+
+        # cardio: HR/W (lower better)
+        if g["hr_per_watt"].notna().sum() >= 10:
+            eco.loc[idx, "eco_hrpw"] = -robust_z(g["hr_per_watt"], g["hr_per_watt"])
+
+        # mech: W/speed (lower better)
+        if g["power_per_speed"].notna().sum() >= 10:
+            eco.loc[idx, "eco_pps"] = -robust_z(g["power_per_speed"], g["power_per_speed"])
+
+        # mechanika (lower better)
+        if g["gct_num"].notna().sum() >= 10:
+            eco.loc[idx, "eco_gct"] = -robust_z(g["gct_num"], g["gct_num"])
+        if g["vr_num"].notna().sum() >= 10:
+            eco.loc[idx, "eco_vr"] = -robust_z(g["vr_num"], g["vr_num"])
+        if g["vo_num"].notna().sum() >= 10:
+            eco.loc[idx, "eco_vo"] = -robust_z(g["vo_num"], g["vo_num"])
+
+        # cadence stability: abs(z) (közel 0 a jó) → -abs(z)
+        if g["cad_num"].notna().sum() >= 10:
+            z = robust_z(g["cad_num"], g["cad_num"])
+            eco.loc[idx, "eco_cad"] = -np.abs(z)
+
+        # stride (higher better)
+        if g["stride_num"].notna().sum() >= 10:
+            eco.loc[idx, "eco_stride"] = robust_z(g["stride_num"], g["stride_num"])
+
+    # első kör: full baseline (temp + slope + speed)
+    for _, g in eco.groupby(group_cols, dropna=False):
+        if len(g) >= 12:
+            fill_group(g)
+
+    # fallback: ha kevés adat temp szerint, lazítunk temp_bin nélkül
+    still_nan = eco["eco_gct"].isna() & eco["eco_vr"].isna() & eco["eco_vo"].isna() & eco["eco_cad"].isna()
+    if still_nan.any():
+        for _, g in eco[still_nan].groupby(["speed_bin", "slope_bucket"], dropna=False):
+            if len(g) >= 12:
+                fill_group(g)
+
+    # hiányzó komponensek 0-ra
+    comp_cols = ["eco_hrpw", "eco_pps", "eco_gct", "eco_vr", "eco_vo", "eco_cad", "eco_stride"]
+    for c in comp_cols:
+        eco[c] = eco[c].fillna(0.0)
+
+    # súlyozás (tuningolható)
+    raw = (
+        0.20 * eco["eco_hrpw"] +     # cardio
+        0.20 * eco["eco_pps"] +      # power->speed
+        0.20 * eco["eco_gct"] +
+        0.15 * eco["eco_vr"] +
+        0.10 * eco["eco_vo"] +
+        0.10 * eco["eco_cad"] +
+        0.05 * eco["eco_stride"]
+    )
+
+    # 0–100 skála
+    p5, p95 = np.nanpercentile(raw, 5), np.nanpercentile(raw, 95)
+    eco["RES_plus"] = (100 * (raw - p5) / (p95 - p5 + 1e-9)).clip(0, 100)
+
+    df.loc[eco.index, "RES_plus"] = eco["RES_plus"].values
+
+# 7) Opcionális: “csúcsos futás” jelzés (intervall / fartlek / domb)
+# max/avg arány → ha magas, akkor a futás sok “surge”-öt tartalmazott
+df["Power_fatigue_hint"] = np.where(
+    df["power_avg_w"].notna() & df["power_max_w"].notna() & (df["power_avg_w"] > 0),
+    df["power_max_w"] / df["power_avg_w"],
+    np.nan
+)
 
 # -------------------------
 # Segédek (biztos, hogy vannak)
@@ -1478,7 +1605,103 @@ with tab_last:
                 min_runs=baseline_min_runs
             )
             st.caption(f"Baseline: **easy** futások (hetek: {baseline_weeks}, min: {baseline_min_runs})")
+            
+        # =========================
+        # RES+ (Running Economy Score) blokk — UTOLSÓ FUTÁS TAB
+        # =========================
+        # Feltételezi, hogy már léteznek ezek a df oszlopok (ha megvannak a CSV-ben / számolva):
+        # - RES_plus
+        # - power_avg_w, power_max_w, Power_fatigue_hint (ha van teljesítmény)
 
+        st.markdown("### ⚡ RES+ (Running Economy) – utolsó futás")
+
+        res_available = ("RES_plus" in base.columns) and base["RES_plus"].notna().any()
+        pavg_available = ("power_avg_w" in base.columns) and base["power_avg_w"].notna().any()
+        pmax_available = ("power_max_w" in base.columns) and base["power_max_w"].notna().any()
+
+        res_last = float(last.get("RES_plus")) if pd.notna(last.get("RES_plus")) else np.nan
+
+        # baseline RES+ (ugyanabból a baseline_full-ból, amit fent választottál)
+        res_base = (
+            float(np.nanmedian(baseline_full["RES_plus"]))
+            if ("RES_plus" in baseline_full.columns and baseline_full["RES_plus"].notna().any())
+            else np.nan
+        )
+        res_delta = (res_last - res_base) if (pd.notna(res_last) and pd.notna(res_base)) else np.nan
+
+        # power értékek
+        pavg_last = float(last.get("power_avg_w")) if pd.notna(last.get("power_avg_w")) else np.nan
+        pmax_last = float(last.get("power_max_w")) if pd.notna(last.get("power_max_w")) else np.nan
+
+        p_ratio = float(last.get("Power_fatigue_hint")) if pd.notna(last.get("Power_fatigue_hint")) else (
+            (pmax_last / pavg_last) if (pd.notna(pmax_last) and pd.notna(pavg_last) and pavg_last > 0) else np.nan
+        )
+
+        if not res_available:
+            st.info("Nincs RES_plus adat (nincs/hiányos power vagy nem futott le a RES+ számítás).")
+        else:
+            # KPI sor
+            cR1, cR2, cR3, cR4 = st.columns(4)
+            cR1.metric("RES_plus", f"{res_last:.1f}" if pd.notna(res_last) else "—")
+
+            if pd.notna(res_base):
+                cR2.metric("RES_plus baseline", f"{res_base:.1f}")
+                cR3.metric("Eltérés", f"{res_delta:+.1f}" if pd.notna(res_delta) else "—")
+            else:
+                cR2.metric("RES_plus baseline", "—")
+                cR3.metric("Eltérés", "—")
+
+            if pavg_available:
+                cR4.metric("Átl. teljesítmény", f"{pavg_last:.0f} W" if pd.notna(pavg_last) else "—")
+            else:
+                cR4.metric("Átl. teljesítmény", "—")
+
+            # Coach értelmezés
+            coach_lines = []
+
+            if pd.notna(res_delta):
+                if res_delta >= 6:
+                    coach_lines.append("🟢 **RES+ nagyot javult** a baseline-hoz képest → gazdaságosabb futás (jobb „költség”).")
+                elif res_delta >= 2:
+                    coach_lines.append("🟢 **RES+ kicsit jobb** a baseline-hoz képest → stabilan jó irány.")
+                elif res_delta > -2:
+                    coach_lines.append("🟡 **RES+ kb. baseline** → normál ingadozás.")
+                elif res_delta > -6:
+                    coach_lines.append("🟠 **RES+ romlott** → lehet domb/hőség/szél vagy technika/fáradás.")
+                else:
+                    coach_lines.append("🔴 **RES+ nagyon romlott** → valószínű erős külső tényező vagy fáradás/terhelés.")
+            else:
+                coach_lines.append("ℹ️ RES+ baseline összevetéshez nincs elég baseline adat.")
+
+            if pd.notna(p_ratio):
+                if p_ratio >= 1.60:
+                    coach_lines.append(f"🟠 **Csúcsos terhelés** (Max/Átl power ≈ {p_ratio:.2f}) → domb/megindulások torzíthatják a technikát és fatigue-t.")
+                elif p_ratio >= 1.40:
+                    coach_lines.append(f"🟡 **Változékony terhelés** (Max/Átl power ≈ {p_ratio:.2f}) → lehet pár emelkedő / gyorsítás.")
+                else:
+                    coach_lines.append(f"🟢 **Egyenletes terhelés** (Max/Átl power ≈ {p_ratio:.2f}).")
+            else:
+                coach_lines.append("ℹ️ Power arány nem számolható (hiányzó Avg/Max teljesítmény).")
+
+            for line in coach_lines[:6]:
+                st.write(line)
+
+            # Mini vizuál: baseline RES+ eloszlás + utolsó pont
+            if ("RES_plus" in baseline_full.columns and baseline_full["RES_plus"].notna().sum() >= 8 and pd.notna(res_last)):
+                tmpb = baseline_full.dropna(subset=["RES_plus"]).copy()
+                tmpb["label"] = "baseline"
+                last_row = pd.DataFrame({"RES_plus": [res_last], "label": ["utolsó"]})
+                tmp = pd.concat([tmpb[["RES_plus", "label"]], last_row], ignore_index=True)
+
+                fig_res = px.histogram(
+                    tmp,
+                    x="RES_plus",
+                    color="label",
+                    barmode="overlay",
+                    nbins=18,
+                    title="RES+ eloszlás a baseline-ban + utolsó futás",
+                )
+                st.plotly_chart(fig_res, use_container_width=True)
         # -------------------------
         # KPI-k
         # -------------------------
