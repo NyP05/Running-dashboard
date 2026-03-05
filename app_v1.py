@@ -816,7 +816,197 @@ df["Power_fatigue_hint"] = np.where(
     df["power_max_w"] / df["power_avg_w"],
     np.nan
 )
+# =========================================================
+# 🔥 FATMAX MODUL (HR / pace / power) + Aerobic decoupling (proxy)
+# =========================================================
 
+def _col_any(df: pd.DataFrame, candidates: list[str]) -> str | None:
+    for c in candidates:
+        if c in df.columns:
+            return c
+    return None
+
+def pace_str_to_sec(p):
+    if pd.isna(p): 
+        return np.nan
+    s = str(p).strip()
+    if s in ("", "--", "None", "nan"):
+        return np.nan
+    try:
+        mm, ss = s.split(":")
+        return int(mm) * 60 + int(ss)
+    except:
+        return np.nan
+
+def compute_efficiency(df: pd.DataFrame,
+                       hr_col: str | None,
+                       pace_col: str | None,
+                       pwr_col: str | None) -> pd.DataFrame:
+    """
+    EF (efficiency factor) proxy:
+      - pace alapú: speed_mps / HR
+      - power alapú (ha van): speed_mps / Power
+    plus: HR_per_speed, HR_per_power (drift jelleg)
+    """
+    out = df.copy()
+
+    # HR
+    if hr_col and hr_col in out.columns:
+        out["_hr"] = to_float_series(out[hr_col])
+    else:
+        out["_hr"] = np.nan
+
+    # pace -> speed
+    if pace_col and pace_col in out.columns:
+        out["_pace_sec"] = out[pace_col].apply(pace_str_to_sec)
+        out["_speed_mps"] = np.where(out["_pace_sec"].notna() & (out["_pace_sec"] > 0),
+                                     1000.0 / out["_pace_sec"], np.nan)
+    else:
+        # fallback: ha van már speed_mps
+        out["_speed_mps"] = out["speed_mps"] if "speed_mps" in out.columns else np.nan
+
+    # power
+    if pwr_col and pwr_col in out.columns:
+        out["_pwr"] = to_float_series(out[pwr_col])
+    else:
+        out["_pwr"] = np.nan
+
+    # EF pace alapú
+    out["EF_pace"] = np.where(out["_speed_mps"].notna() & out["_hr"].notna() & (out["_hr"] > 0),
+                              out["_speed_mps"] / out["_hr"], np.nan)
+
+    # EF power alapú (ha van)
+    out["EF_power"] = np.where(out["_speed_mps"].notna() & out["_pwr"].notna() & (out["_pwr"] > 0),
+                               out["_speed_mps"] / out["_pwr"], np.nan)
+
+    # drift proxyk (minél kisebb annál jobb)
+    out["HR_per_speed"] = np.where(out["_speed_mps"].notna() & out["_speed_mps"] > 0,
+                                   out["_hr"] / out["_speed_mps"], np.nan)
+    out["HR_per_power"] = np.where(out["_pwr"].notna() & out["_pwr"] > 0,
+                                   out["_hr"] / out["_pwr"], np.nan)
+
+    return out
+
+def estimate_fatmax_from_runs(df_runs: pd.DataFrame,
+                              hrmax: int,
+                              hr_col: str,
+                              pace_col: str,
+                              pwr_col: str | None = None,
+                              min_points: int = 12):
+    """
+    Fatmax becslés futásonkénti (activity summary) adatokból.
+
+    Lépés:
+    1) számolunk EF_pace-et és EF_power-t
+    2) HR% szerint bin-eljük az aerob tartományban (0.55-0.80)
+    3) ott keressük a legjobb medián EF-et
+    4) visszaadjuk a "Fatmax HR%" binhez tartozó medián HR / pace / power-t
+    """
+    if df_runs is None or len(df_runs) == 0:
+        return None
+
+    x = df_runs.copy()
+
+    # kötelezők
+    if hr_col not in x.columns or pace_col not in x.columns:
+        return None
+
+    x = compute_efficiency(x, hr_col=hr_col, pace_col=pace_col, pwr_col=pwr_col)
+
+    x = x.dropna(subset=["Dátum", "_hr", "_speed_mps"])
+    if len(x) < min_points:
+        return None
+
+    x["HR_pct"] = x["_hr"] / float(hrmax)
+
+    # aerob tartomány
+    x = x[(x["HR_pct"] >= 0.55) & (x["HR_pct"] <= 0.80)].copy()
+    if len(x) < min_points:
+        return None
+
+    # binek (2% lépés)
+    bins = np.arange(0.55, 0.80 + 0.0001, 0.02)
+    x["HR_bin"] = pd.cut(x["HR_pct"], bins=bins, include_lowest=True)
+
+    # melyik EF-et használjuk?
+    use_power = ("EF_power" in x.columns) and (x["EF_power"].notna().sum() >= max(6, min_points // 2))
+    ef_col = "EF_power" if use_power else "EF_pace"
+
+    grp = x.groupby("HR_bin")[ef_col].median().dropna()
+    if grp.empty:
+        return None
+
+    best_bin = grp.idxmax()
+    x_best = x[x["HR_bin"] == best_bin].copy()
+    if x_best.empty:
+        return None
+
+    # medián értékek a binben
+    hr_fatmax = float(np.nanmedian(x_best["_hr"]))
+    speed_fatmax = float(np.nanmedian(x_best["_speed_mps"]))
+    pace_sec = 1000.0 / speed_fatmax if speed_fatmax > 0 else np.nan
+
+    def sec_to_pace_str(sec):
+        if pd.isna(sec):
+            return "—"
+        sec = float(sec)
+        mm = int(sec // 60)
+        ss = int(round(sec - mm * 60))
+        return f"{mm}:{ss:02d}"
+
+    pace_fatmax = sec_to_pace_str(pace_sec)
+
+    pwr_fatmax = float(np.nanmedian(x_best["_pwr"])) if (use_power and x_best["_pwr"].notna().any()) else np.nan
+
+    # HR% bin közép
+    lo = float(best_bin.left) if hasattr(best_bin, "left") else np.nan
+    hi = float(best_bin.right) if hasattr(best_bin, "right") else np.nan
+    hrpct_mid = (lo + hi) / 2.0 if (pd.notna(lo) and pd.notna(hi)) else np.nan
+
+    return {
+        "ef_col": ef_col,
+        "best_bin": str(best_bin),
+        "hrpct_mid": hrpct_mid,
+        "hr_fatmax": hr_fatmax,
+        "pace_fatmax": pace_fatmax,
+        "pwr_fatmax": pwr_fatmax,
+        "n_points": int(len(x_best)),
+        "table": x,         # a teljes aerob tartományos futás-halmaz
+        "table_best": x_best # a kiválasztott bin
+    }
+
+def aerobic_decoupling_proxy(last_row: pd.Series,
+                             baseline_df: pd.DataFrame,
+                             hr_col: str,
+                             pace_col: str,
+                             pwr_col: str | None):
+    """
+    Decoupling (proxy) = EF romlás/javulás a baseline mediánhoz képest.
+    - EF_pace: speed/HR (nagyobb jobb)
+    - EF_power: speed/power (nagyobb jobb, ha van power)
+    Visszaad százalékos eltérést: +% = javulás, -% = romlás
+    """
+    if baseline_df is None or len(baseline_df) < 8:
+        return None
+
+    tmp = baseline_df.copy()
+    tmp = compute_efficiency(tmp, hr_col=hr_col, pace_col=pace_col, pwr_col=pwr_col)
+
+    # last
+    last_df = pd.DataFrame([last_row]).copy()
+    last_df = compute_efficiency(last_df, hr_col=hr_col, pace_col=pace_col, pwr_col=pwr_col)
+
+    # válassz EF-et: power ha van elég adat
+    use_power = ("EF_power" in tmp.columns) and (tmp["EF_power"].notna().sum() >= 8) and (last_df["EF_power"].notna().sum() >= 1)
+    ef = "EF_power" if use_power else "EF_pace"
+
+    b = float(np.nanmedian(tmp[ef]))
+    v = float(last_df[ef].iloc[0]) if pd.notna(last_df[ef].iloc[0]) else np.nan
+    if pd.isna(b) or b == 0 or pd.isna(v):
+        return None
+
+    delta_pct = (v - b) / b * 100.0
+    return {"ef": ef, "baseline_med": b, "last": v, "delta_pct": float(delta_pct)}
 # -------------------------
 # Segédek (biztos, hogy vannak)
 # -------------------------
@@ -1605,7 +1795,130 @@ with tab_last:
                 min_runs=baseline_min_runs
             )
             st.caption(f"Baseline: **easy** futások (hetek: {baseline_weeks}, min: {baseline_min_runs})")
-            
+                  # =========================================================
+        # 🔥 FATMAX + AEROBIC DECOUPLING (proxy) blokk
+        # =========================================================
+        st.divider()
+        st.subheader("🔥 Fatmax & Aerobic decoupling (proxy)")
+
+        # oszlopok felderítése (HU Garmin)
+        hr_col = _col_any(base, ["Átlagos pulzusszám", "Átlagos pulzusszám "])
+        pace_col = _col_any(base, ["Átlagos tempó"])
+        pwr_col = _col_any(base, ["Átl. teljesítmény", "Átlagos teljesítmény", "Average Power", "Avg Power"])
+        pwr_max_col = _col_any(base, ["Max. teljesítmény", "Maximum Power", "Max Power"])
+
+        if hr_col is None or pace_col is None:
+            st.info("Fatmax-hoz kell: **Átlagos pulzusszám** és **Átlagos tempó** oszlop.")
+        else:
+            # csak futások + értelmes adatok (baseline halmazból számolunk fatmax-ot)
+            # javaslat: baseline_full-hoz hasonló típuson érdemes (easy/tempo/race baseline szerint)
+            fat_base = baseline_full.copy() if baseline_full is not None and len(baseline_full) > 0 else base.copy()
+
+            fatmax = estimate_fatmax_from_runs(
+                df_runs=fat_base,
+                hrmax=hrmax,
+                hr_col=hr_col,
+                pace_col=pace_col,
+                pwr_col=pwr_col,
+                min_points=12
+            )
+
+            # Aerobic decoupling proxy (EF last vs baseline)
+            dec = aerobic_decoupling_proxy(
+                last_row=last,
+                baseline_df=baseline_full,
+                hr_col=hr_col,
+                pace_col=pace_col,
+                pwr_col=pwr_col
+            )
+
+            # --- KPI sor (Fatmax pace/hr/power + decoupling)
+            k1, k2, k3, k4 = st.columns(4)
+
+            if fatmax is None:
+                k1.metric("Fatmax HR", "—")
+                k2.metric("Fatmax tempó", "—")
+                k3.metric("Fatmax power", "—")
+                k4.metric("Decoupling (proxy)", "—")
+                st.caption("Kevés adat a Fatmax becsléshez (kell ~12+ releváns futás az aerob tartományból).")
+            else:
+                k1.metric("Fatmax HR (becslés)", f"{fatmax['hr_fatmax']:.0f} bpm", delta=f"HR% bin: {fatmax['best_bin']}")
+                k2.metric("Fatmax tempó (becslés)", f"{fatmax['pace_fatmax']}/km", delta=f"N={fatmax['n_points']}")
+                if pd.notna(fatmax["pwr_fatmax"]):
+                    k3.metric("Fatmax power (becslés)", f"{fatmax['pwr_fatmax']:.0f} W", delta=f"EF: {fatmax['ef_col']}")
+                else:
+                    k3.metric("Fatmax power (becslés)", "—", delta=f"EF: {fatmax['ef_col']}")
+
+                if dec is None:
+                    k4.metric("Aerobic decoupling (proxy)", "—")
+                else:
+                    # +% = jobb (EF nőtt), -% = rosszabb (EF esett)
+                    k4.metric("Aerobic decoupling (proxy)", f"{dec['delta_pct']:+.1f}%", delta=f"{dec['ef']}")
+
+                # --- kiegészítő: last power / max power arány (csúcsos terhelés jelző)
+                if pwr_col and pwr_col in base.columns:
+                    last_pwr = to_float_series(pd.Series([last.get(pwr_col)])).iloc[0]
+                else:
+                    last_pwr = np.nan
+
+                if pwr_max_col and pwr_max_col in base.columns:
+                    last_pwr_max = to_float_series(pd.Series([last.get(pwr_max_col)])).iloc[0]
+                else:
+                    last_pwr_max = np.nan
+
+                if pd.notna(last_pwr) and pd.notna(last_pwr_max) and last_pwr > 0:
+                    ratio = float(last_pwr_max / last_pwr)
+                    # 2.0 felett gyakran “csúcsos”, domb / interval / sprint jelleg
+                    if ratio >= 2.0:
+                        st.warning(f"⚠️ Csúcsos terhelés: Max/Avg power = **{ratio:.2f}** → domb/megindulások torzíthatják a technikát és Fatigue-t.")
+                    else:
+                        st.success(f"✅ Terhelés eloszlás: Max/Avg power = **{ratio:.2f}** (nem extrém csúcsos).")
+
+                # --- plot: EF vs HR% (aerob tartomány)
+                dfp = fatmax["table"].copy()
+                dfp = dfp.dropna(subset=["HR_pct", fatmax["ef_col"]])
+
+                if len(dfp) >= 10:
+                    fig_ef = px.scatter(
+                        dfp,
+                        x="HR_pct",
+                        y=fatmax["ef_col"],
+                        hover_data=["Dátum", "Run_type", "Cím"] if "Cím" in dfp.columns else ["Dátum", "Run_type"],
+                        labels={"HR_pct": "HR% (HR/HRmax)", fatmax["ef_col"]: fatmax["ef_col"]},
+                        title="Fatmax becslés: EF az aerob tartományban (HR%)"
+                    )
+                    # kijelölt bin megjelölése
+                    if pd.notna(fatmax.get("hrpct_mid")):
+                        fig_ef.add_vline(x=fatmax["hrpct_mid"])
+                    st.plotly_chart(fig_ef, use_container_width=True)
+
+                # --- trend: Fatmax pace (proxy trend) heti bontás (ha van elég adat)
+                # egyszerű: heti median EF legjobb binjének pace mediánja rolling ablakon
+                df_tr = fat_base.copy()
+                df_tr = df_tr.dropna(subset=["Dátum"]).sort_values("Dátum")
+                if len(df_tr) >= 20:
+                    df_tr["_week"] = df_tr["Dátum"].dt.to_period("W").dt.start_time
+                    rows = []
+                    for wk, g in df_tr.groupby("_week"):
+                        fm = estimate_fatmax_from_runs(g, hrmax, hr_col, pace_col, pwr_col, min_points=8)
+                        if fm is None:
+                            continue
+                        rows.append([wk, fm["hr_fatmax"], fm["pace_fatmax"], fm["pwr_fatmax"]])
+
+                    if len(rows) >= 6:
+                        tdf = pd.DataFrame(rows, columns=["week", "fatmax_hr", "fatmax_pace_str", "fatmax_pwr"])
+                        # pace stringből sec (trendhez)
+                        tdf["fatmax_pace_sec"] = tdf["fatmax_pace_str"].apply(pace_str_to_sec)
+
+                        fig_tr = px.line(
+                            tdf.sort_values("week"),
+                            x="week",
+                            y="fatmax_pace_sec",
+                            labels={"week": "Hét", "fatmax_pace_sec": "Fatmax tempó (sec/km)"},
+                            title="Fatmax tempó trend (heti becslés)"
+                        )
+                        st.plotly_chart(fig_tr, use_container_width=True)
+                        st.caption("Megjegyzés: ez becslés (futás-összegző adatokból), de nagyon jól jelzi az aerob fejlődést.")  
         # =========================
         # RES+ (Running Economy Score) blokk — UTOLSÓ FUTÁS TAB
         # =========================
