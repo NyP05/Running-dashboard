@@ -2543,14 +2543,22 @@ with tab_pmc:
             )
             st.plotly_chart(fig_opt, use_container_width=True)
 
-            # Scatter: minden hét
+            # Scatter: minden hét (trendvonal: numpy polyfit)
             fig_scatter_opt = px.scatter(
                 opt["weekly"],
                 x="load", y="outcome",
-                trendline="ols",
                 labels={"load": load_label_opt, "outcome": "Jövőbeli Technika+RES átlag"},
                 title=f"Heti terhelés vs jövőbeli adaptáció (+{opt['lag_weeks']} hét lag)",
             )
+            _tmp = opt["weekly"].dropna(subset=["load", "outcome"])
+            if len(_tmp) >= 3:
+                _xf = _tmp["load"].to_numpy(dtype=float)
+                _yf = _tmp["outcome"].to_numpy(dtype=float)
+                _m, _b = np.polyfit(_xf, _yf, 1)
+                _xs = np.linspace(_xf.min(), _xf.max(), 60)
+                fig_scatter_opt.add_scatter(x=_xs, y=_m * _xs + _b,
+                                             mode="lines", name="Trend",
+                                             line=dict(color="red", dash="dash"))
             if pd.notna(opt["optimum_lo"]):
                 fig_scatter_opt.add_vrect(
                     x0=opt["optimum_lo"], x1=opt["optimum_hi"],
@@ -2598,13 +2606,21 @@ with tab_pmc:
             # Idősoros kép: easy % vs future tech
             best_col = f"{ir['best_type']}_pct"
             if best_col in ir["merged"].columns:
+                _ir_df = ir["merged"].dropna(subset=[best_col, "tech_future"])
                 fig_ir = px.scatter(
-                    ir["merged"].dropna(subset=[best_col, "tech_future"]),
+                    _ir_df,
                     x=best_col, y="tech_future",
-                    trendline="ols",
                     labels={best_col: f"{best_hu} arány (%)", "tech_future": f"Technika +{ir['lag_weeks']} hét"},
                     title=f"{best_hu} arány vs jövőbeli Technika",
                 )
+                if len(_ir_df) >= 3:
+                    _xf = _ir_df[best_col].to_numpy(dtype=float)
+                    _yf = _ir_df["tech_future"].to_numpy(dtype=float)
+                    _m, _b = np.polyfit(_xf, _yf, 1)
+                    _xs = np.linspace(_xf.min(), _xf.max(), 60)
+                    fig_ir.add_scatter(x=_xs, y=_m * _xs + _b,
+                                       mode="lines", name="Trend",
+                                       line=dict(color="red", dash="dash"))
                 if pd.notna(ir["opt_lo"]):
                     fig_ir.add_vrect(
                         x0=ir["opt_lo"], x1=ir["opt_hi"],
@@ -2669,15 +2685,22 @@ with tab_recovery:
 
             st.divider()
 
-            # --- Scatter: fatigue vs recovery_days + trendvonal
+            # --- Scatter: fatigue vs recovery_days + trendvonal (numpy polyfit)
             fig_rec = px.scatter(
                 rec["df"],
                 x="fatigue",
                 y="recovery_days",
-                trendline="ols",
                 labels={"fatigue": "Fatigue_score az eseménynél", "recovery_days": "Recovery napok"},
                 title="Fatigue_score vs Recovery idő (saját adatok alapján)",
             )
+            if len(rec["df"]) >= 3:
+                _xf = rec["df"]["fatigue"].to_numpy(dtype=float)
+                _yf = rec["df"]["recovery_days"].to_numpy(dtype=float)
+                _m, _b = np.polyfit(_xf, _yf, 1)
+                _xs = np.linspace(_xf.min(), _xf.max(), 60)
+                fig_rec.add_scatter(x=_xs, y=_m * _xs + _b,
+                                    mode="lines", name="Trend",
+                                    line=dict(color="orange", dash="dash"))
 
             # Aktuális fatigue megjelölése
             if rec["current_fat"] is not None and rec["predicted_days"] is not None:
@@ -2861,11 +2884,19 @@ with tab_asym:
                         x=fatigue_col,
                         y=sel_asym,
                         color="Edzés típusa" if "Edzés típusa" in af_df.columns else None,
-                        trendline="ols",
                         labels={fatigue_col: "Fatigue_score", sel_asym: asym_labels.get(sel_asym, sel_asym)},
                         title="Összefügg-e a fáradtság az aszimmetriával?",
                         opacity=0.7,
                     )
+                    _xf = af_df[fatigue_col].to_numpy(dtype=float)
+                    _yf = af_df[sel_asym].to_numpy(dtype=float)
+                    _valid = ~(np.isnan(_xf) | np.isnan(_yf))
+                    if _valid.sum() >= 3:
+                        _m, _b = np.polyfit(_xf[_valid], _yf[_valid], 1)
+                        _xs = np.linspace(_xf[_valid].min(), _xf[_valid].max(), 60)
+                        fig_af.add_scatter(x=_xs, y=_m * _xs + _b,
+                                           mode="lines", name="Trend",
+                                           line=dict(color="red", dash="dash"))
                     corr_af = float(af_df[fatigue_col].corr(af_df[sel_asym]))
                     st.plotly_chart(fig_af, use_container_width=True)
                     if abs(corr_af) >= 0.4:
