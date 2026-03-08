@@ -32,6 +32,26 @@ CFG = {
     "daily_coach_fat_bad": 60.0,
     "daily_coach_fat_warn": 45.0,
     "daily_coach_trend_bad": -6.0,
+    # ---- ACWR / TSS / CTL / ATL
+    "acwr_acute_days": 7,
+    "acwr_chronic_days": 28,
+    "acwr_safe_lo": 0.8,
+    "acwr_safe_hi": 1.3,
+    "acwr_warn_hi": 1.5,
+    "ctl_decay": 42,
+    "atl_decay": 7,
+    "tsb_green": 5,
+    "tsb_red": -30,
+    # ---- Recovery time
+    "recovery_lookback_weeks": 24,
+    "recovery_min_events": 8,
+    # ---- Aszimmetria
+    "asym_warn_pct": 3.0,
+    "asym_red_pct": 5.0,
+    # ---- Optimális terhelés modell
+    "optload_lag_weeks": 2,
+    "optload_min_weeks": 10,
+    "intratio_lag_weeks": 3,
 }
 
 # =========================================================
@@ -559,6 +579,499 @@ def aerobic_decoupling_proxy(
 
 
 # =========================================================
+# ÚJ MODUL 1: TSS PROXY
+# =========================================================
+
+def compute_tss_proxy(df: pd.DataFrame, hrmax: int) -> pd.Series:
+    """
+    Training Stress Score proxy futásonként (HR + duration alapján).
+    TSS = (dur_sec × hr_avg × IF) / (hrmax × 3600) × 100
+    IF = hr_avg / hr_threshold  (hr_threshold = 0.85 × hrmax)
+    Fallback ha nincs HR: pace-alapú skálázás.
+    """
+    hr_thr = 0.85 * hrmax
+    tss = np.full(len(df), np.nan)
+
+    has_hr = df["hr_num"].notna() & df["dur_sec"].notna() & (df["dur_sec"] > 0)
+    if has_hr.any():
+        IF_ = df.loc[has_hr, "hr_num"] / hr_thr
+        tss_hr = (df.loc[has_hr, "dur_sec"] * df.loc[has_hr, "hr_num"] * IF_) / (hrmax * 3600) * 100
+        tss[np.where(has_hr)[0]] = tss_hr.values
+
+    no_hr = ~has_hr & df["pace_sec_km"].notna() & df["dist_km"].notna()
+    if no_hr.any():
+        valid_pace = df.loc[df["pace_sec_km"].notna(), "pace_sec_km"]
+        thr_pace = float(np.nanpercentile(valid_pace, 40)) if len(valid_pace) >= 10 else np.nan
+        if pd.notna(thr_pace) and thr_pace > 0:
+            IF_pace = thr_pace / df.loc[no_hr, "pace_sec_km"]
+            tss_pace = IF_pace ** 2 * df.loc[no_hr, "dist_km"] * (thr_pace / 60)
+            tss[np.where(no_hr)[0]] = tss_pace.clip(0, 500).values
+
+    return pd.Series(tss, index=df.index)
+
+
+def compute_acwr(df: pd.DataFrame,
+                 load_col: str = "TSS_proxy",
+                 acute_days: int = 7,
+                 chronic_days: int = 28) -> pd.DataFrame:
+    """
+    ACWR (Acute:Chronic Workload Ratio) napi szinten.
+    """
+    if load_col not in df.columns or df[load_col].isna().all():
+        return pd.DataFrame()
+
+    daily = (
+        df.dropna(subset=["Dátum"])
+        .groupby(df["Dátum"].dt.date)[load_col]
+        .sum()
+        .reset_index()
+        .rename(columns={"Dátum": "date", load_col: "load"})
+        .sort_values("date")
+    )
+    daily["date"] = pd.to_datetime(daily["date"])
+    date_range = pd.date_range(daily["date"].min(), daily["date"].max(), freq="D")
+    daily = daily.set_index("date").reindex(date_range, fill_value=0).reset_index()
+    daily.columns = ["date", "load"]
+
+    daily["acute"] = daily["load"].rolling(acute_days, min_periods=1).mean()
+    daily["chronic"] = daily["load"].rolling(chronic_days, min_periods=7).mean()
+    daily["acwr"] = np.where(
+        daily["chronic"].notna() & (daily["chronic"] > 0),
+        daily["acute"] / daily["chronic"],
+        np.nan,
+    )
+
+    def _acwr_status(v):
+        if pd.isna(v): return "ismeretlen"
+        if v < CFG["acwr_safe_lo"]: return "alulterhelt"
+        if v <= CFG["acwr_safe_hi"]: return "optimális"
+        if v <= CFG["acwr_warn_hi"]: return "figyelmeztető"
+        return "veszélyes"
+
+    daily["acwr_status"] = daily["acwr"].apply(_acwr_status)
+    return daily
+
+
+def compute_ctl_atl_tsb(daily_load: pd.DataFrame) -> pd.DataFrame:
+    """
+    CTL (fittség, ~42 nap EMA), ATL (fáradtság, ~7 nap EMA), TSB (forma = CTL - ATL).
+    """
+    if daily_load.empty or "load" not in daily_load.columns:
+        return pd.DataFrame()
+
+    ctl_d = CFG["ctl_decay"]
+    atl_d = CFG["atl_decay"]
+    alpha_ctl = 1.0 - np.exp(-1.0 / ctl_d)
+    alpha_atl = 1.0 - np.exp(-1.0 / atl_d)
+
+    loads = daily_load["load"].fillna(0).to_numpy(dtype=float)
+    ctl = np.zeros(len(loads))
+    atl = np.zeros(len(loads))
+    ctl[0] = loads[0]
+    atl[0] = loads[0]
+    for i in range(1, len(loads)):
+        ctl[i] = ctl[i - 1] + alpha_ctl * (loads[i] - ctl[i - 1])
+        atl[i] = atl[i - 1] + alpha_atl * (loads[i] - atl[i - 1])
+
+    out = daily_load.copy()
+    out["CTL"] = ctl
+    out["ATL"] = atl
+    out["TSB"] = ctl - atl
+
+    def _tsb_status(v):
+        if pd.isna(v): return "ismeretlen"
+        if v >= CFG["tsb_green"]: return "forma"
+        if v >= -10: return "friss"
+        if v >= -20: return "fáradt"
+        if v >= CFG["tsb_red"]: return "túlterhelt"
+        return "kritikus"
+
+    out["TSB_status"] = out["TSB"].apply(_tsb_status)
+    return out
+
+
+def injury_risk_score(
+    acwr_val: float | None,
+    tsb_val: float | None,
+    fatigue_val: float | None,
+    asym_val: float | None,
+    ramp_val: float | None,
+) -> tuple[float, str, list[str]]:
+    """
+    Összetett sérüléskockázati score (0–100).
+    Súlyok: ACWR 35%, TSB 25%, Fatigue 20%, Ramp 15%, Aszimmetria 5%.
+    """
+    components = []
+    explanations = []
+
+    if acwr_val is not None and not np.isnan(float(acwr_val)):
+        v = float(acwr_val)
+        if v < CFG["acwr_safe_lo"]:
+            r, txt = 20, f"ACWR {v:.2f}: alulterhelt (detraining kockázat)"
+        elif v <= CFG["acwr_safe_hi"]:
+            r, txt = 5, f"ACWR {v:.2f}: optimális zónában ✓"
+        elif v <= CFG["acwr_warn_hi"]:
+            r, txt = 50, f"ACWR {v:.2f}: figyelmeztető – csökkentsd a terhelést"
+        else:
+            r, txt = 90, f"ACWR {v:.2f}: veszélyes – azonnali tehercsökkentés"
+        components.append((r, 0.35)); explanations.append(txt)
+
+    if tsb_val is not None and not np.isnan(float(tsb_val)):
+        v = float(tsb_val)
+        if v >= CFG["tsb_green"]:
+            r, txt = 10, f"TSB {v:+.1f}: jó forma ✓"
+        elif v >= -10:
+            r, txt = 25, f"TSB {v:+.1f}: friss"
+        elif v >= -20:
+            r, txt = 55, f"TSB {v:+.1f}: fáradt"
+        elif v >= CFG["tsb_red"]:
+            r, txt = 80, f"TSB {v:+.1f}: túlterhelt – pihenő szükséges"
+        else:
+            r, txt = 95, f"TSB {v:+.1f}: kritikus – azonnali leállás"
+        components.append((r, 0.25)); explanations.append(txt)
+
+    if fatigue_val is not None and not np.isnan(float(fatigue_val)):
+        v = float(fatigue_val)
+        r = float(np.clip(v, 0, 100))
+        txt = (f"Fatigue {v:.0f}: magas" if v > 70
+               else f"Fatigue {v:.0f}: közepes" if v > 50
+               else f"Fatigue {v:.0f}: alacsony ✓")
+        components.append((r, 0.20)); explanations.append(txt)
+
+    if ramp_val is not None and not np.isnan(float(ramp_val)):
+        v = float(ramp_val)
+        r = 10 if v <= 8 else 45 if v <= 12 else 75 if v <= 20 else 95
+        if v > 8:
+            explanations.append(f"Ramp rate {v:+.1f}%: gyors terhelésnövelés")
+        components.append((r, 0.15))
+
+    if asym_val is not None and not np.isnan(float(asym_val)):
+        v = float(asym_val)
+        if v < CFG["asym_warn_pct"]:
+            r = 5
+        elif v < CFG["asym_red_pct"]:
+            r, _ = 40, explanations.append(f"Aszimmetria {v:.1f}%: figyelemre méltó")
+        else:
+            r, _ = 75, explanations.append(f"Aszimmetria {v:.1f}%: magas – sérülésprediktív")
+        # r lehet None ha append-ből jött, fix:
+        r = r if isinstance(r, (int, float)) else 40
+        components.append((r, 0.05))
+
+    if not components:
+        return np.nan, "ismeretlen", ["Nincs elég adat."]
+
+    total_w = sum(w for _, w in components)
+    score = float(np.clip(sum(r * w for r, w in components) / total_w, 0, 100))
+
+    status = (
+        "🟢 Alacsony" if score < 25
+        else "🟡 Közepes" if score < 50
+        else "🟠 Magas" if score < 70
+        else "🔴 Kritikus"
+    )
+    return score, status, [e for e in explanations if e is not None]
+
+
+# =========================================================
+# ÚJ MODUL 2: RECOVERY TIME MODELL
+# =========================================================
+
+def compute_recovery_model(
+    df: pd.DataFrame,
+    fatigue_col: str,
+    run_type_col: str | None,
+    lookback_weeks: int = 24,
+    min_events: int = 8,
+) -> dict | None:
+    """
+    Meghatározza, hogy egy magas Fatigue esemény után hány napra állt vissza
+    a Technika_index. Lineáris regressziót illeszt: fatigue → recovery_days.
+    """
+    if "Technika_index" not in df.columns or fatigue_col not in df.columns:
+        return None
+    base = df.dropna(subset=["Dátum", "Technika_index", fatigue_col]).sort_values("Dátum").copy()
+    if len(base) < min_events * 3:
+        return None
+
+    cutoff = base["Dátum"].max() - pd.Timedelta(weeks=lookback_weeks)
+    base = base[base["Dátum"] >= cutoff].copy()
+
+    easy = (
+        base[base[run_type_col] == "easy"].copy()
+        if run_type_col and run_type_col in base.columns
+        else base.copy()
+    )
+    if len(easy) < min_events:
+        return None
+
+    events = base[base[fatigue_col] > 65].copy()
+    if len(events) < min_events:
+        thr = np.nanpercentile(base[fatigue_col], 75)
+        events = base[base[fatigue_col] >= thr].copy()
+    if len(events) < 4:
+        return None
+
+    rec_days_list, fat_list, pre_tech_list = [], [], []
+
+    for _, ev in events.iterrows():
+        ev_date = ev["Dátum"]
+        fat_val = float(ev[fatigue_col])
+
+        pre_w = easy[
+            (easy["Dátum"] >= ev_date - pd.Timedelta(days=21))
+            & (easy["Dátum"] < ev_date - pd.Timedelta(days=1))
+        ]
+        if len(pre_w) < 2:
+            continue
+        pre_tech = float(np.nanmedian(pre_w["Technika_index"]))
+
+        post = easy[
+            (easy["Dátum"] > ev_date) & (easy["Dátum"] <= ev_date + pd.Timedelta(days=30))
+        ].sort_values("Dátum")
+        if len(post) < 2:
+            continue
+
+        recovered_day = None
+        for i in range(len(post) - 1):
+            t1 = float(post.iloc[i]["Technika_index"])
+            t2 = float(post.iloc[i + 1]["Technika_index"])
+            if abs(t1 - pre_tech) <= 7 and abs(t2 - pre_tech) <= 7:
+                recovered_day = (post.iloc[i]["Dátum"] - ev_date).days
+                break
+
+        if recovered_day is not None and 0 < recovered_day <= 30:
+            rec_days_list.append(recovered_day)
+            fat_list.append(fat_val)
+            pre_tech_list.append(pre_tech)
+
+    if len(rec_days_list) < 4:
+        return None
+
+    rec_arr = np.array(rec_days_list, dtype=float)
+    fat_arr = np.array(fat_list, dtype=float)
+
+    coeffs = np.polyfit(fat_arr, rec_arr, 1) if np.std(fat_arr) > 1e-6 else [0, float(np.median(rec_arr))]
+
+    current_fat = None
+    if df[fatigue_col].notna().any():
+        current_fat = float(df.dropna(subset=[fatigue_col]).sort_values("Dátum").iloc[-1][fatigue_col])
+
+    predicted_days = None
+    if current_fat is not None:
+        predicted_days = max(0, int(round(float(np.polyval(coeffs, current_fat)))))
+
+    return {
+        "rec_arr": rec_arr,
+        "fat_arr": fat_arr,
+        "coeffs": coeffs,
+        "median_recovery": float(np.median(rec_arr)),
+        "n_events": len(rec_arr),
+        "current_fat": current_fat,
+        "predicted_days": predicted_days,
+        "df": pd.DataFrame({"fatigue": fat_arr, "recovery_days": rec_arr}),
+    }
+
+
+# =========================================================
+# ÚJ MODUL 3: ASZIMMETRIA
+# =========================================================
+
+def compute_asymmetry(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Bal/jobb aszimmetria számítás Garmin Running Dynamics adatokból.
+    Aszimmetria index = |bal - jobb| / ((bal + jobb) / 2) × 100
+    """
+    result = df.copy()
+
+    def _asym_pct(left_s: pd.Series, right_s: pd.Series) -> pd.Series:
+        mean_lr = (left_s + right_s) / 2
+        return np.where(
+            left_s.notna() & right_s.notna() & (mean_lr > 0),
+            np.abs(left_s - right_s) / mean_lr * 100,
+            np.nan,
+        )
+
+    # GCT
+    lc = next((c for c in df.columns if "bal" in c.lower() and "gct" in c.lower()), None)
+    rc = next((c for c in df.columns if "jobb" in c.lower() and "gct" in c.lower()), None)
+    result["asym_gct_pct"] = (
+        pd.Series(_asym_pct(to_float_series(df[lc]), to_float_series(df[rc])), index=df.index)
+        if lc and rc else np.nan
+    )
+
+    # Lépéshossz
+    lc = next((c for c in df.columns if "bal" in c.lower() and ("lépés" in c.lower() or "stride" in c.lower())), None)
+    rc = next((c for c in df.columns if "jobb" in c.lower() and ("lépés" in c.lower() or "stride" in c.lower())), None)
+    result["asym_stride_pct"] = (
+        pd.Series(_asym_pct(to_float_series(df[lc]), to_float_series(df[rc])), index=df.index)
+        if lc and rc else np.nan
+    )
+
+    # Power balance
+    bal_col = next((c for c in df.columns if "egyensúly" in c.lower() or "balance" in c.lower()), None)
+    result["asym_power_pct"] = (
+        np.abs(to_float_series(df[bal_col]) - 50.0) * 2 if bal_col else np.nan
+    )
+
+    # Összesített score
+    asym_w = {"asym_gct_pct": 0.50, "asym_stride_pct": 0.30, "asym_power_pct": 0.20}
+    available = [c for c in asym_w if c in result.columns and result[c].notna().any()]
+    if available:
+        total_w = sum(asym_w[c] for c in available)
+        result["Asymmetry_score"] = (
+            sum(result[c].fillna(0) * asym_w[c] for c in available) / total_w
+        ).clip(0, 20)
+    else:
+        result["Asymmetry_score"] = np.nan
+
+    return result
+
+
+# =========================================================
+# ÚJ MODUL 4: OPTIMÁLIS TERHELÉSI ABLAK
+# =========================================================
+
+def compute_optimal_load_window(
+    df: pd.DataFrame,
+    load_col: str,
+    tech_col: str = "Technika_index",
+    res_col: str = "RES_plus",
+    lag_weeks: int = 2,
+) -> dict | None:
+    """
+    Lagged korreláció: heti terhelés vs következő lag_weeks hét Technika + RES átlaga.
+    Meghatározza, melyik km/TSS tartományban volt a legjobb adaptáció.
+    """
+    if load_col not in df.columns or tech_col not in df.columns:
+        return None
+    w = df.dropna(subset=["Dátum"]).copy()
+    w["week"] = w["Dátum"].dt.to_period("W").dt.start_time
+
+    agg_spec: dict = {"load": (load_col, "sum")}
+    if tech_col in w.columns:
+        agg_spec["tech"] = (tech_col, "mean")
+    if res_col in w.columns and w[res_col].notna().any():
+        agg_spec["res"] = (res_col, "mean")
+
+    weekly = w.groupby("week", as_index=False).agg(**agg_spec).sort_values("week")
+    if len(weekly) < CFG["optload_min_weeks"]:
+        return None
+
+    if "tech" in weekly.columns:
+        weekly["tech_future"] = weekly["tech"].shift(-lag_weeks).rolling(lag_weeks, min_periods=1).mean()
+    if "res" in weekly.columns:
+        weekly["res_future"] = weekly["res"].shift(-lag_weeks).rolling(lag_weeks, min_periods=1).mean()
+
+    out_cols = [c for c in ["tech_future", "res_future"] if c in weekly.columns and weekly[c].notna().sum() >= 8]
+    if not out_cols:
+        return None
+
+    weekly["outcome"] = weekly[out_cols].mean(axis=1)
+    weekly = weekly.dropna(subset=["outcome", "load"])
+    if len(weekly) < 8:
+        return None
+
+    weekly["load_bin"] = pd.qcut(weekly["load"], q=5, duplicates="drop")
+    bin_means = (
+        weekly.groupby("load_bin", observed=True)
+        .agg(load_mid=("load", "median"), outcome_med=("outcome", "median"), count=("load", "count"))
+        .reset_index()
+        .sort_values("load_mid")
+    )
+    best_idx = bin_means["outcome_med"].idxmax()
+    best_bin = bin_means.loc[best_idx]
+    corr = float(weekly["load"].corr(weekly["outcome"]))
+
+    lo = float(best_bin["load_bin"].left) if hasattr(best_bin["load_bin"], "left") else np.nan
+    hi = float(best_bin["load_bin"].right) if hasattr(best_bin["load_bin"], "right") else np.nan
+
+    return {
+        "weekly": weekly,
+        "bin_means": bin_means,
+        "optimum_lo": lo,
+        "optimum_hi": hi,
+        "optimum_mid": float(best_bin["load_mid"]),
+        "corr": corr,
+        "lag_weeks": lag_weeks,
+        "load_col": load_col,
+        "n_weeks": len(weekly),
+    }
+
+
+def compute_intensity_ratio_effect(
+    df: pd.DataFrame,
+    run_type_col: str | None,
+    tech_col: str = "Technika_index",
+    lag_weeks: int = 3,
+) -> dict | None:
+    """
+    Lagged korreláció: heti easy/tempo/race/interval arány vs következő
+    lag_weeks hét Technika_index változása.
+    """
+    if run_type_col is None or run_type_col not in df.columns or tech_col not in df.columns:
+        return None
+    w = df.dropna(subset=["Dátum", run_type_col]).copy()
+    w["week"] = w["Dátum"].dt.to_period("W").dt.start_time
+
+    type_counts = (
+        w.groupby(["week", run_type_col], observed=True)
+        .size()
+        .unstack(fill_value=0)
+        .reset_index()
+    )
+    for t in ["easy", "tempo", "race", "interval"]:
+        if t not in type_counts.columns:
+            type_counts[t] = 0
+
+    type_counts["total"] = type_counts[["easy", "tempo", "race", "interval"]].sum(axis=1)
+    for t in ["easy", "tempo", "race", "interval"]:
+        type_counts[f"{t}_pct"] = np.where(
+            type_counts["total"] > 0, type_counts[t] / type_counts["total"] * 100, np.nan
+        )
+
+    tech_weekly = w.groupby("week")[tech_col].mean().reset_index()
+    merged = type_counts.merge(tech_weekly, on="week", how="inner").sort_values("week")
+    if len(merged) < 10:
+        return None
+
+    merged["tech_future"] = merged[tech_col].shift(-lag_weeks).rolling(lag_weeks, min_periods=1).mean()
+    merged = merged.dropna(subset=["tech_future"])
+    if len(merged) < 8:
+        return None
+
+    corrs = {}
+    for t in ["easy", "tempo", "race", "interval"]:
+        col = f"{t}_pct"
+        if col in merged.columns and merged[col].notna().sum() >= 8:
+            c = float(merged[col].corr(merged["tech_future"]))
+            if not np.isnan(c):
+                corrs[t] = c
+
+    if not corrs:
+        return None
+
+    best_type = max(corrs, key=lambda k: corrs[k])
+    best_pct_col = f"{best_type}_pct"
+    mc = merged.dropna(subset=[best_pct_col, "tech_future"])
+    opt_lo = opt_hi = np.nan
+    if len(mc) >= 8:
+        mc = mc.copy()
+        mc["pct_bin"] = pd.qcut(mc[best_pct_col], q=4, duplicates="drop")
+        best_pct_bin = mc.groupby("pct_bin", observed=True)["tech_future"].median().idxmax()
+        opt_lo = float(best_pct_bin.left) if hasattr(best_pct_bin, "left") else np.nan
+        opt_hi = float(best_pct_bin.right) if hasattr(best_pct_bin, "right") else np.nan
+
+    return {
+        "corrs": corrs,
+        "best_type": best_type,
+        "opt_lo": opt_lo,
+        "opt_hi": opt_hi,
+        "merged": merged,
+        "lag_weeks": lag_weeks,
+    }
+
+
+# =========================================================
 # ADATBEOLVASÁS (cached)
 # =========================================================
 
@@ -953,6 +1466,23 @@ def full_pipeline(file_bytes: bytes, file_name: str) -> pd.DataFrame:
         eco["RES_plus"] = (100 * (raw - p5) / (p95 - p5 + 1e-9)).clip(0, 100)
         df.loc[eco.index, "RES_plus"] = eco["RES_plus"].values
 
+    # =========================================================
+    # TSS PROXY (a hrmax-ot itt nem ismerjük -> placeholder 185)
+    # A valódi hrmax-ot a tab-ban alkalmazzuk, de 185-tel is elég jó közelítés
+    # pipeline-on belüli számításhoz; a tab átszámolja ha user beállít mást.
+    # =========================================================
+    df["dur_sec"] = np.nan
+    time_cands = [c for c in ["Idő", "Menetidő", "Eltelt idő"] if c in df.columns]
+    if time_cands:
+        df["dur_sec"] = df[time_cands[0]].apply(duration_to_seconds)
+
+    df["TSS_proxy"] = compute_tss_proxy(df, hrmax=185)
+
+    # =========================================================
+    # ASZIMMETRIA
+    # =========================================================
+    df = compute_asymmetry(df)
+
     return df
 
 
@@ -1087,8 +1617,9 @@ view = d.loc[mask].copy().sort_values("Dátum")
 # =========================================================
 # TABOK
 # =========================================================
-tab_overview, tab_last, tab_warn, tab_ready, tab_data = st.tabs(
-    ["📌 Áttekintés", "🔎 Utolsó futás", "🚦 Warning", "🏁 Readiness", "📄 Adatok"]
+tab_overview, tab_last, tab_warn, tab_ready, tab_pmc, tab_recovery, tab_asym, tab_data = st.tabs(
+    ["📌 Áttekintés", "🔎 Utolsó futás", "🚦 Warning", "🏁 Readiness",
+     "📈 PMC & Kockázat", "🔄 Recovery", "⚖️ Aszimmetria", "📄 Adatok"]
 )
 
 # =========================================================
@@ -1843,6 +2374,537 @@ with tab_ready:
                     if "Cím" in w_r.columns:
                         show_cols_r.append("Cím")
                     st.dataframe(w_r.sort_values("Dátum", ascending=False)[show_cols_r], use_container_width=True, hide_index=True)
+
+
+# =========================================================
+# TAB: PMC & SÉRÜLÉSKOCKÁZAT
+# =========================================================
+with tab_pmc:
+    st.subheader("📈 Performance Management Chart – CTL / ATL / TSB")
+    st.caption("CTL = fittség (42 napos EMA), ATL = fáradtság (7 napos EMA), TSB = forma (CTL − ATL).")
+
+    # TSS újraszámítás a user HRmax-szal
+    d_pmc = d.copy()
+    if "TSS_proxy" in d_pmc.columns:
+        d_pmc["TSS_proxy"] = compute_tss_proxy(d_pmc, hrmax)
+
+    acwr_df = compute_acwr(d_pmc, load_col="TSS_proxy",
+                            acute_days=CFG["acwr_acute_days"],
+                            chronic_days=CFG["acwr_chronic_days"])
+
+    if acwr_df.empty:
+        st.info("Nincs elég TSS adat a PMC-hez (kell: Dátum + pulzus vagy tempó + táv).")
+    else:
+        pmc_df = compute_ctl_atl_tsb(acwr_df)
+
+        # Aktuális értékek
+        last_pmc = pmc_df.iloc[-1]
+        acwr_now = float(last_pmc.get("acwr", np.nan))
+        tsb_now = float(last_pmc.get("TSB", np.nan))
+        ctl_now = float(last_pmc.get("CTL", np.nan))
+        atl_now = float(last_pmc.get("ATL", np.nan))
+
+        # Ramp rate (újra számolva itt)
+        rr_pmc = np.nan
+        if len(acwr_df) >= 35:
+            last7 = acwr_df.tail(7)["load"].sum()
+            prev28_mean = acwr_df.tail(35).head(28)["load"].mean()
+            if prev28_mean > 0:
+                rr_pmc = (last7 / 7 - prev28_mean) / prev28_mean * 100
+
+        # Utolsó fatigue és aszimmetria
+        fat_now = None
+        if fatigue_col and d_pmc[fatigue_col].notna().any():
+            fat_now = float(d_pmc.dropna(subset=[fatigue_col]).sort_values("Dátum").iloc[-1][fatigue_col])
+
+        asym_now = None
+        if "Asymmetry_score" in d_pmc.columns and d_pmc["Asymmetry_score"].notna().any():
+            asym_now = float(d_pmc.dropna(subset=["Asymmetry_score"]).sort_values("Dátum").iloc[-1]["Asymmetry_score"])
+
+        # Sérüléskockázat
+        inj_score, inj_status, inj_expl = injury_risk_score(
+            acwr_val=acwr_now,
+            tsb_val=tsb_now,
+            fatigue_val=fat_now,
+            asym_val=asym_now,
+            ramp_val=rr_pmc,
+        )
+
+        # --- KPI sor
+        c1, c2, c3, c4, c5 = st.columns(5)
+        c1.metric("CTL (fittség)", f"{ctl_now:.1f}" if pd.notna(ctl_now) else "—")
+        c2.metric("ATL (fáradtság)", f"{atl_now:.1f}" if pd.notna(atl_now) else "—")
+        c3.metric("TSB (forma)", f"{tsb_now:+.1f}" if pd.notna(tsb_now) else "—",
+                  delta=last_pmc.get("TSB_status", ""))
+        c4.metric("ACWR", f"{acwr_now:.2f}" if pd.notna(acwr_now) else "—",
+                  delta=last_pmc.get("acwr_status", ""))
+        c5.metric("Sérüléskockázat", f"{inj_score:.0f}/100" if pd.notna(inj_score) else "—",
+                  delta=inj_status)
+
+        # Státusz doboz
+        if inj_status.startswith("🔴"):
+            st.error(f"**{inj_status}** sérüléskockázat")
+        elif inj_status.startswith("🟠"):
+            st.warning(f"**{inj_status}** sérüléskockázat")
+        elif inj_status.startswith("🟡"):
+            st.warning(f"**{inj_status}** sérüléskockázat")
+        else:
+            st.success(f"**{inj_status}** sérüléskockázat")
+
+        with st.expander("🔍 Kockázati komponensek részletezése", expanded=True):
+            for e in inj_expl:
+                st.write(f"• {e}")
+
+        st.divider()
+
+        # --- PMC idősor (CTL / ATL / TSB)
+        st.markdown("#### 📊 CTL / ATL / TSB idősor")
+        pmc_plot = pmc_df.tail(180).copy()
+
+        fig_pmc = px.line(
+            pmc_plot, x="date", y=["CTL", "ATL"],
+            labels={"date": "Dátum", "value": "TSS egység", "variable": "Mutató"},
+            title="Fittség (CTL) vs Fáradtság (ATL)",
+            color_discrete_map={"CTL": "#2ecc71", "ATL": "#e74c3c"},
+        )
+        st.plotly_chart(fig_pmc, use_container_width=True)
+
+        fig_tsb = px.area(
+            pmc_plot, x="date", y="TSB",
+            title="Forma (TSB = CTL − ATL)",
+            labels={"date": "Dátum", "TSB": "TSB (forma)"},
+            color_discrete_sequence=["#3498db"],
+        )
+        fig_tsb.add_hline(y=CFG["tsb_green"], line_dash="dot", line_color="green",
+                           annotation_text="Forma zóna")
+        fig_tsb.add_hline(y=CFG["tsb_red"], line_dash="dot", line_color="red",
+                           annotation_text="Kritikus zóna")
+        fig_tsb.add_hline(y=0, line_color="gray", line_width=1)
+        st.plotly_chart(fig_tsb, use_container_width=True)
+
+        st.divider()
+
+        # --- ACWR idősor
+        st.markdown("#### ⚡ ACWR (Acute:Chronic Workload Ratio)")
+        acwr_plot = acwr_df.tail(120).copy()
+        fig_acwr = px.line(
+            acwr_plot, x="date", y="acwr",
+            title="ACWR idősor",
+            labels={"date": "Dátum", "acwr": "ACWR"},
+            color_discrete_sequence=["#e67e22"],
+        )
+        fig_acwr.add_hrect(y0=CFG["acwr_safe_lo"], y1=CFG["acwr_safe_hi"],
+                            fillcolor="green", opacity=0.08, annotation_text="Optimális zóna")
+        fig_acwr.add_hrect(y0=CFG["acwr_safe_hi"], y1=CFG["acwr_warn_hi"],
+                            fillcolor="orange", opacity=0.08, annotation_text="Figyelmeztető")
+        fig_acwr.add_hrect(y0=CFG["acwr_warn_hi"], y1=3.0,
+                            fillcolor="red", opacity=0.08, annotation_text="Veszélyes")
+        st.plotly_chart(fig_acwr, use_container_width=True)
+        st.caption(
+            "🟢 Optimális zóna: 0.8–1.3 | 🟠 Figyelmeztető: 1.3–1.5 | 🔴 Veszélyes: >1.5  "
+            "(Gabbett & Hulin irodalmi küszöbök alapján)"
+        )
+
+        st.divider()
+
+        # --- Optimális terhelési ablak
+        st.markdown("#### 🎯 Optimális heti terhelési ablak (saját adataid alapján)")
+
+        load_src = "TSS_proxy" if d_pmc["TSS_proxy"].notna().sum() >= 10 else "dist_km"
+        load_label_opt = "Heti TSS" if load_src == "TSS_proxy" else "Heti km"
+
+        opt = compute_optimal_load_window(
+            d_pmc, load_col=load_src,
+            lag_weeks=CFG["optload_lag_weeks"]
+        )
+
+        if opt is None:
+            st.info(f"Nincs elég heti adat az optimum becsléshez (min {CFG['optload_min_weeks']} hét).")
+        else:
+            st.caption(
+                f"Módszer: heti {load_label_opt} vs következő {opt['lag_weeks']} hét Technika + RES+ átlaga. "
+                f"Korreláció: {opt['corr']:+.2f} | {opt['n_weeks']} hét alapján."
+            )
+
+            if pd.notna(opt["optimum_lo"]) and pd.notna(opt["optimum_hi"]):
+                st.success(
+                    f"🎯 Legjobb adaptáció **{opt['optimum_lo']:.0f}–{opt['optimum_hi']:.0f} {load_label_opt}** "
+                    f"heti terhelésnél (medián: {opt['optimum_mid']:.0f})."
+                )
+
+            fig_opt = px.bar(
+                opt["bin_means"],
+                x="load_mid",
+                y="outcome_med",
+                title=f"Technika + RES+ outcome terhelési bin szerint ({load_label_opt})",
+                labels={"load_mid": load_label_opt, "outcome_med": "Átlag Technika+RES (következő hetek)"},
+                color="outcome_med",
+                color_continuous_scale="RdYlGn",
+            )
+            st.plotly_chart(fig_opt, use_container_width=True)
+
+            # Scatter: minden hét
+            fig_scatter_opt = px.scatter(
+                opt["weekly"],
+                x="load", y="outcome",
+                trendline="ols",
+                labels={"load": load_label_opt, "outcome": "Jövőbeli Technika+RES átlag"},
+                title=f"Heti terhelés vs jövőbeli adaptáció (+{opt['lag_weeks']} hét lag)",
+            )
+            if pd.notna(opt["optimum_lo"]):
+                fig_scatter_opt.add_vrect(
+                    x0=opt["optimum_lo"], x1=opt["optimum_hi"],
+                    fillcolor="green", opacity=0.1,
+                    annotation_text="Optimum tartomány",
+                )
+            st.plotly_chart(fig_scatter_opt, use_container_width=True)
+
+        st.divider()
+
+        # --- Intenzitás-arány hatás
+        st.markdown("#### 🧩 Intenzitás-arány hatása az adaptációra (saját adataid)")
+        ir = compute_intensity_ratio_effect(
+            d_pmc, run_type_col=run_type_col,
+            lag_weeks=CFG["intratio_lag_weeks"]
+        )
+
+        if ir is None:
+            st.info("Nincs elég adat az intenzitás-arány elemzéshez.")
+        else:
+            # Korreláció bar chart
+            corr_df = pd.DataFrame({
+                "Típus": list(ir["corrs"].keys()),
+                "Korreláció": list(ir["corrs"].values()),
+            }).sort_values("Korreláció", ascending=False)
+            corr_df["Típus_hu"] = corr_df["Típus"].apply(run_type_hu)
+
+            fig_corr = px.bar(
+                corr_df, x="Típus_hu", y="Korreláció",
+                color="Korreláció",
+                color_continuous_scale="RdYlGn",
+                title=f"Heti edzéstípus-arány korrelációja a jövőbeli Technikával (+{ir['lag_weeks']} hét)",
+                labels={"Típus_hu": "Edzés típusa", "Korreláció": "Pearson r"},
+            )
+            fig_corr.add_hline(y=0, line_color="gray")
+            st.plotly_chart(fig_corr, use_container_width=True)
+
+            best_hu = run_type_hu(ir["best_type"])
+            if pd.notna(ir["opt_lo"]) and pd.notna(ir["opt_hi"]):
+                st.success(
+                    f"📐 A legjobb **{best_hu}** arány a következő hetekre: "
+                    f"**{ir['opt_lo']:.0f}–{ir['opt_hi']:.0f}%** (az összes futásból)."
+                )
+
+            # Idősoros kép: easy % vs future tech
+            best_col = f"{ir['best_type']}_pct"
+            if best_col in ir["merged"].columns:
+                fig_ir = px.scatter(
+                    ir["merged"].dropna(subset=[best_col, "tech_future"]),
+                    x=best_col, y="tech_future",
+                    trendline="ols",
+                    labels={best_col: f"{best_hu} arány (%)", "tech_future": f"Technika +{ir['lag_weeks']} hét"},
+                    title=f"{best_hu} arány vs jövőbeli Technika",
+                )
+                if pd.notna(ir["opt_lo"]):
+                    fig_ir.add_vrect(
+                        x0=ir["opt_lo"], x1=ir["opt_hi"],
+                        fillcolor="green", opacity=0.1,
+                        annotation_text="Optimum",
+                    )
+                st.plotly_chart(fig_ir, use_container_width=True)
+
+        with st.expander("📋 PMC napi adatok (utolsó 60 nap)"):
+            st.dataframe(pmc_df.tail(60)[["date", "load", "acute", "chronic", "acwr", "acwr_status", "CTL", "ATL", "TSB", "TSB_status"]],
+                         use_container_width=True, hide_index=True)
+
+
+# =========================================================
+# TAB: RECOVERY TIME MODELL
+# =========================================================
+with tab_recovery:
+    st.subheader("🔄 Recovery Time Modell")
+    st.caption(
+        "Megmutatja, hogy egy adott Fatigue_score szintű futás után "
+        "saját adataid alapján hány napra volt szükség a Technika_index "
+        "visszaállásához. Így becsülhető, mikor \"vagy készen\" az intenzív terhelésre."
+    )
+
+    if fatigue_col is None or "Technika_index" not in d.columns:
+        st.info("Recovery modellhez kell Fatigue_score és Technika_index.")
+    else:
+        rec = compute_recovery_model(
+            d,
+            fatigue_col=fatigue_col,
+            run_type_col=run_type_col,
+            lookback_weeks=CFG["recovery_lookback_weeks"],
+            min_events=CFG["recovery_min_events"],
+        )
+
+        if rec is None:
+            st.info(
+                "Nincs elég adat a recovery modellhez. "
+                f"Kell: legalább ~{CFG['recovery_min_events']} magas-fatigue esemény + "
+                "utánuk legalább 2 easy futás 30 napon belül."
+            )
+        else:
+            # --- KPI sor
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Medián recovery", f"{rec['median_recovery']:.0f} nap")
+            c2.metric("Elemzett események", f"{rec['n_events']}")
+            c3.metric("Jelenlegi Fatigue", f"{rec['current_fat']:.0f}" if rec["current_fat"] else "—")
+            c4.metric(
+                "Becsült recovery",
+                f"{rec['predicted_days']} nap" if rec["predicted_days"] is not None else "—",
+                delta="holnaptól számítva" if rec["predicted_days"] else None,
+            )
+
+            if rec["predicted_days"] is not None:
+                p = rec["predicted_days"]
+                if p <= 1:
+                    st.success(f"🟢 **Valószínűleg felépültél** – becsült recovery: {p} nap.")
+                elif p <= 3:
+                    st.warning(f"🟠 **Még {p} nap ajánlott** könnyű edzés / pihenő a teli intenzitás előtt.")
+                else:
+                    st.error(f"🔴 **Becsült recovery: {p} nap** – ne emelj terhelést még.")
+
+            st.divider()
+
+            # --- Scatter: fatigue vs recovery_days + trendvonal
+            fig_rec = px.scatter(
+                rec["df"],
+                x="fatigue",
+                y="recovery_days",
+                trendline="ols",
+                labels={"fatigue": "Fatigue_score az eseménynél", "recovery_days": "Recovery napok"},
+                title="Fatigue_score vs Recovery idő (saját adatok alapján)",
+            )
+
+            # Aktuális fatigue megjelölése
+            if rec["current_fat"] is not None and rec["predicted_days"] is not None:
+                fig_rec.add_scatter(
+                    x=[rec["current_fat"]],
+                    y=[rec["predicted_days"]],
+                    mode="markers",
+                    marker=dict(size=14, color="red", symbol="star"),
+                    name="Jelenlegi becslés",
+                )
+
+            st.plotly_chart(fig_rec, use_container_width=True)
+
+            # --- Hisztogram: recovery napok eloszlása
+            fig_hist = px.histogram(
+                rec["df"],
+                x="recovery_days",
+                nbins=12,
+                title="Recovery napok eloszlása",
+                labels={"recovery_days": "Recovery napok"},
+                color_discrete_sequence=["#3498db"],
+            )
+            fig_hist.add_vline(
+                x=rec["median_recovery"],
+                line_dash="dash", line_color="orange",
+                annotation_text=f"Medián: {rec['median_recovery']:.0f} nap",
+            )
+            st.plotly_chart(fig_hist, use_container_width=True)
+
+            # --- Recovery görbék: technika alakulása esemény után
+            st.markdown("#### 📉 Technika alakulása magas-Fatigue esemény után")
+            base_rec = d.dropna(subset=["Dátum", "Technika_index", fatigue_col]).sort_values("Dátum").copy()
+            events_rec = base_rec[base_rec[fatigue_col] > 65].copy()
+            if len(events_rec) < 3:
+                thr_r = np.nanpercentile(base_rec[fatigue_col], 75)
+                events_rec = base_rec[base_rec[fatigue_col] >= thr_r].copy()
+
+            if run_type_col and run_type_col in base_rec.columns:
+                easy_rec = base_rec[base_rec[run_type_col] == "easy"].copy()
+            else:
+                easy_rec = base_rec.copy()
+
+            curves = []
+            for ev_idx, (_, ev) in enumerate(events_rec.tail(8).iterrows()):
+                ev_date = ev["Dátum"]
+                post = easy_rec[
+                    (easy_rec["Dátum"] > ev_date) &
+                    (easy_rec["Dátum"] <= ev_date + pd.Timedelta(days=21))
+                ].sort_values("Dátum").copy()
+                if len(post) < 2:
+                    continue
+                post["days_after"] = (post["Dátum"] - ev_date).dt.days
+                post["event_label"] = ev_date.strftime("%Y-%m-%d")
+                post["fat_at_event"] = round(float(ev[fatigue_col]), 0)
+                curves.append(post[["days_after", "Technika_index", "event_label", "fat_at_event"]])
+
+            if curves:
+                curve_df = pd.concat(curves, ignore_index=True)
+                fig_curves = px.line(
+                    curve_df,
+                    x="days_after",
+                    y="Technika_index",
+                    color="event_label",
+                    hover_data=["fat_at_event"],
+                    labels={"days_after": "Napok az esemény után", "Technika_index": "Technika_index", "event_label": "Esemény dátuma"},
+                    title="Technika visszaépülési görbék (legutóbbi 8 magas-Fatigue esemény)",
+                )
+                st.plotly_chart(fig_curves, use_container_width=True)
+                st.caption("Minden vonal egy esemény utáni easy futássorozatot mutat.")
+            else:
+                st.info("Nincs elég post-event easy futás a görbék rajzolásához.")
+
+            with st.expander("📋 Recovery esemény adatok"):
+                st.dataframe(rec["df"].sort_values("fatigue", ascending=False),
+                             use_container_width=True, hide_index=True)
+
+
+# =========================================================
+# TAB: ASZIMMETRIA
+# =========================================================
+with tab_asym:
+    st.subheader("⚖️ Futási aszimmetria elemzés")
+    st.caption(
+        "Bal/jobb oldali különbségek (GCT, lépéshossz, power balance). "
+        ">3% figyelmeztető, >5% sérülésprediktív határ (irodalmi konszenzus)."
+    )
+
+    asym_available = any(
+        c in d.columns and d[c].notna().any()
+        for c in ["asym_gct_pct", "asym_stride_pct", "asym_power_pct", "Asymmetry_score"]
+    )
+
+    if not asym_available:
+        st.info(
+            "Nincs bal/jobb aszimmetria adat a feltöltött fájlban. "
+            "Ehhez szükséges: **Bal GCT / Jobb GCT**, **Bal lépéshossz / Jobb lépéshossz**, "
+            "vagy **Egyensúly** (power balance %) Garmin oszlopok."
+        )
+        st.markdown(
+            "**Hogyan exportálhatod?** Garmin Connect → Tevékenységek → "
+            "Export CSV → győződj meg, hogy a Running Dynamics mezők be vannak kapcsolva "
+            "az eszköz beállításaiban (Running Dynamics Pod vagy kompatibilis óra szükséges)."
+        )
+    else:
+        asym_base = d.dropna(subset=["Dátum"]).sort_values("Dátum").copy()
+
+        # --- Aktuális aszimmetria (utolsó futás)
+        last_asym = asym_base.dropna(subset=["Asymmetry_score"]).iloc[-1] if asym_base["Asymmetry_score"].notna().any() else None
+
+        if last_asym is not None:
+            asym_val = float(last_asym["Asymmetry_score"])
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Összesített aszimmetria", f"{asym_val:.1f}%")
+            c2.metric("GCT aszimmetria", f"{float(last_asym.get('asym_gct_pct', np.nan)):.1f}%" if pd.notna(last_asym.get("asym_gct_pct")) else "—")
+            c3.metric("Lépéshossz aszimmetria", f"{float(last_asym.get('asym_stride_pct', np.nan)):.1f}%" if pd.notna(last_asym.get("asym_stride_pct")) else "—")
+            c4.metric("Power balance eltérés", f"{float(last_asym.get('asym_power_pct', np.nan)):.1f}%" if pd.notna(last_asym.get("asym_power_pct")) else "—")
+
+            if asym_val >= CFG["asym_red_pct"]:
+                st.error(f"🔴 Magas aszimmetria ({asym_val:.1f}%) – sérülésprediktív jel. Javasolt: erősítő edzés + fizioterápiás konzultáció.")
+            elif asym_val >= CFG["asym_warn_pct"]:
+                st.warning(f"🟠 Figyelemre méltó aszimmetria ({asym_val:.1f}%) – kövesd figyelemmel az alakulást.")
+            else:
+                st.success(f"🟢 Jó szimmetria ({asym_val:.1f}%) – nincs aggodalomra ok.")
+
+        st.divider()
+
+        # --- Aszimmetria idősor
+        asym_cols_present = [c for c in ["asym_gct_pct", "asym_stride_pct", "asym_power_pct", "Asymmetry_score"]
+                             if c in asym_base.columns and asym_base[c].notna().any()]
+
+        if asym_cols_present:
+            asym_labels = {
+                "asym_gct_pct": "GCT aszimmetria (%)",
+                "asym_stride_pct": "Lépéshossz aszimmetria (%)",
+                "asym_power_pct": "Power balance eltérés (%)",
+                "Asymmetry_score": "Összesített aszimmetria (%)",
+            }
+            sel_asym = st.selectbox(
+                "Melyik aszimmetria mutatót nézzük?",
+                options=asym_cols_present,
+                format_func=lambda x: asym_labels.get(x, x),
+                key="asym_sel",
+            )
+
+            plot_asym = asym_base.dropna(subset=[sel_asym]).copy()
+            color_col = run_type_col if run_type_col and run_type_col in plot_asym.columns else None
+
+            fig_asym = px.scatter(
+                plot_asym,
+                x="Dátum",
+                y=sel_asym,
+                color="Edzés típusa" if "Edzés típusa" in plot_asym.columns else color_col,
+                hover_data=[c for c in ["Cím", "dist_km", "Átlagos tempó"] if c in plot_asym.columns],
+                labels={"Dátum": "Dátum", sel_asym: asym_labels.get(sel_asym, sel_asym)},
+                title=f"{asym_labels.get(sel_asym, sel_asym)} idősor",
+                opacity=0.7,
+            )
+            # Rolling átlag
+            roll_asym = plot_asym[["Dátum", sel_asym]].sort_values("Dátum").copy()
+            if len(roll_asym) >= 10:
+                roll_asym["roll"] = roll_asym[sel_asym].rolling(10, min_periods=5).mean()
+                for tr in px.line(roll_asym, x="Dátum", y="roll", color_discrete_sequence=["black"]).data:
+                    tr.name = "10 futás átlag"
+                    tr.showlegend = True
+                    fig_asym.add_trace(tr)
+
+            fig_asym.add_hline(y=CFG["asym_warn_pct"], line_dash="dot", line_color="orange",
+                                annotation_text=f"Figyelmeztetés ({CFG['asym_warn_pct']}%)")
+            fig_asym.add_hline(y=CFG["asym_red_pct"], line_dash="dot", line_color="red",
+                                annotation_text=f"Kockázati küszöb ({CFG['asym_red_pct']}%)")
+            st.plotly_chart(fig_asym, use_container_width=True)
+
+            # --- Aszimmetria vs Fatigue kapcsolat
+            st.divider()
+            st.markdown("#### 🔗 Aszimmetria vs Fatigue_score")
+            if fatigue_col and fatigue_col in asym_base.columns:
+                af_df = asym_base.dropna(subset=[sel_asym, fatigue_col]).copy()
+                if len(af_df) >= 10:
+                    fig_af = px.scatter(
+                        af_df,
+                        x=fatigue_col,
+                        y=sel_asym,
+                        color="Edzés típusa" if "Edzés típusa" in af_df.columns else None,
+                        trendline="ols",
+                        labels={fatigue_col: "Fatigue_score", sel_asym: asym_labels.get(sel_asym, sel_asym)},
+                        title="Összefügg-e a fáradtság az aszimmetriával?",
+                        opacity=0.7,
+                    )
+                    corr_af = float(af_df[fatigue_col].corr(af_df[sel_asym]))
+                    st.plotly_chart(fig_af, use_container_width=True)
+                    if abs(corr_af) >= 0.4:
+                        st.info(f"📊 Korreláció (Fatigue ↔ Aszimmetria): **{corr_af:+.2f}** – látható összefüggés.")
+                    else:
+                        st.caption(f"Korreláció (Fatigue ↔ Aszimmetria): {corr_af:+.2f} – nincs erős kapcsolat.")
+                else:
+                    st.info("Kevés átfedő adat a Fatigue–Aszimmetria elemzéshez.")
+            else:
+                st.info("Fatigue_score hiányában nem számolható a korreláció.")
+
+            # --- Aszimmetria statisztika
+            st.divider()
+            st.markdown("#### 📊 Aszimmetria statisztika")
+            stat_cols = [c for c in ["asym_gct_pct", "asym_stride_pct", "asym_power_pct", "Asymmetry_score"]
+                         if c in asym_base.columns and asym_base[c].notna().any()]
+            if stat_cols:
+                stat_rows = []
+                for sc in stat_cols:
+                    series = asym_base[sc].dropna()
+                    stat_rows.append({
+                        "Mutató": asym_labels.get(sc, sc),
+                        "Medián (%)": f"{series.median():.2f}",
+                        "Átlag (%)": f"{series.mean():.2f}",
+                        "Max (%)": f"{series.max():.2f}",
+                        "Futások >3%": int((series > 3).sum()),
+                        "Futások >5%": int((series > 5).sum()),
+                    })
+                st.dataframe(pd.DataFrame(stat_rows), use_container_width=True, hide_index=True)
+
+        with st.expander("📋 Aszimmetria adatok (szűrt nézet)"):
+            asym_show_cols = ["Dátum"] + [c for c in ["asym_gct_pct", "asym_stride_pct", "asym_power_pct", "Asymmetry_score"] if c in view.columns]
+            if "Edzés típusa" in view.columns:
+                asym_show_cols.insert(1, "Edzés típusa")
+            st.dataframe(
+                view.dropna(subset=[c for c in asym_show_cols if c in view.columns][2:3])
+                    .sort_values("Dátum", ascending=False)[asym_show_cols],
+                use_container_width=True, hide_index=True,
+            )
 
 
 # =========================================================
