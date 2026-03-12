@@ -52,6 +52,15 @@ CFG = {
     "optload_lag_weeks": 2,
     "optload_min_weeks": 10,
     "intratio_lag_weeks": 3,
+    # ---- Easy Run Target zóna
+    "easy_target_hr_pct_lo": 0.68,   # HRmax % – easy zóna alsó határ
+    "easy_target_hr_pct_hi": 0.76,   # HRmax % – easy zóna felső határ
+    "easy_fatigue_penalty_hr": 3.0,  # bpm levonás minden 10 Fatigue pont után
+    "easy_fatigue_penalty_pace": 4.0,# sec/km levonás minden 10 Fatigue pont után
+    "easy_fatigue_penalty_pwr": 5.0, # W levonás minden 10 Fatigue pont után
+    "easy_target_band_hr": 5,        # ±bpm a célsáv szélessége
+    "easy_target_band_pace": 7,      # ±sec/km a célsáv szélessége
+    "easy_target_band_pwr": 10,      # ±W a célsáv szélessége
 }
 
 # =========================================================
@@ -576,6 +585,221 @@ def aerobic_decoupling_proxy(
     if pd.isna(b) or b == 0 or pd.isna(v):
         return None
     return {"ef": ef, "baseline_med": b, "last": v, "delta_pct": float((v - b) / b * 100.0)}
+
+
+# =========================================================
+# EASY RUN TARGET MODUL
+# =========================================================
+
+def compute_easy_target(
+    df: pd.DataFrame,
+    hrmax: int,
+    fatigue_col: str | None,
+    run_type_col: str | None,
+    hr_col: str | None,
+    pace_col: str | None,
+    pwr_col: str | None,
+    baseline_weeks: int = 12,
+    baseline_min_runs: int = 20,
+) -> dict | None:
+    """
+    Napi Easy Run Target zóna számítása.
+
+    Logika (3 réteg):
+
+    1) ALAP ZÓNA (Fatmax + HR%):
+       - Fatmax HR-ből kiindulva képezzük az easy zónát
+         (Fatmax alatt tartjuk magunkat, de nem túl alacsony)
+       - Ha nincs Fatmax, HRmax % alapú fallback (68–76%)
+
+    2) SZEMÉLYRE SZABÁS (saját easy futások mediánja):
+       - Az utolsó baseline_weeks hét easy futásainak medián HR/pace/power értéke
+         adja a "személyes easy baseline"-t
+       - Ez fontosabb mint a generikus % (mert ténylegesen téged jellemez)
+
+    3) FÁRADTSÁG-KORREKCIÓ (Fatigue_score alapján):
+       - Minden 10 Fatigue pont felett a 40-es "nyugalmi" szint fölött:
+         HR célt LEJJEBB toljuk (a szív nehezebben dolgozik, óvjuk)
+         Pace célt LASSABB irányba toljuk
+         Power célt LEJJEBB toljuk
+       - Ez a napi "frissesség" hatás
+
+    Visszatér: dict a célsávokkal és az összes közbülső értékkel.
+    """
+    if df is None or len(df) == 0:
+        return None
+
+    base = df.dropna(subset=["Dátum"]).sort_values("Dátum").copy()
+
+    # ---- 1. Easy baseline futások kiválasztása
+    if run_type_col and run_type_col in base.columns:
+        easy = base[base[run_type_col] == "easy"].copy()
+    else:
+        easy = base.copy()
+
+    easy = easy.dropna(subset=["Dátum"]).sort_values("Dátum")
+    last_date = base["Dátum"].max()
+    start_bl = last_date - pd.Timedelta(weeks=baseline_weeks)
+    easy_bl = easy[easy["Dátum"] >= start_bl].copy()
+    if len(easy_bl) < baseline_min_runs:
+        easy_bl = easy.tail(baseline_min_runs).copy()
+
+    if len(easy_bl) < 5:
+        return None
+
+    # ---- 2. Személyes easy medián értékek
+    hr_med = float(np.nanmedian(easy_bl[hr_col])) if hr_col and hr_col in easy_bl.columns else np.nan
+    pace_med_sec = float(np.nanmedian(easy_bl["pace_sec_km"])) if "pace_sec_km" in easy_bl.columns else np.nan
+    pwr_med = float(np.nanmedian(easy_bl[pwr_col])) if pwr_col and pwr_col in easy_bl.columns else np.nan
+
+    # ---- 3. Fatmax alapú HR zóna
+    fatmax_hr = np.nan
+    fatmax_pace_sec = np.nan
+    fatmax_pwr = np.nan
+
+    if hr_col and "pace_sec_km" in base.columns:
+        # Fatmax-hoz az easy baseline-t használjuk
+        tmp_fm = easy_bl.copy()
+        if "Átlagos tempó" not in tmp_fm.columns and "pace_sec_km" in tmp_fm.columns:
+            # pace_sec_km → visszakonvertálás stringgé (estimate_fatmax ezt várja)
+            tmp_fm["_pace_str"] = tmp_fm["pace_sec_km"].apply(
+                lambda s: sec_to_pace_str(s) if pd.notna(s) else np.nan
+            )
+            _pace_col_fm = "_pace_str"
+        else:
+            _pace_col_fm = pace_col if pace_col else "Átlagos tempó"
+
+        fm = estimate_fatmax_from_runs(
+            tmp_fm, hrmax=hrmax,
+            hr_col=hr_col,
+            pace_col=_pace_col_fm,
+            pwr_col=pwr_col,
+            min_points=10,
+        )
+        if fm:
+            fatmax_hr = fm["hr_fatmax"]
+            fatmax_pwr = fm["pwr_fatmax"] if pd.notna(fm["pwr_fatmax"]) else np.nan
+            # Fatmax pace sec visszakonvertálás
+            fatmax_pace_sec = pace_str_to_sec(fm["pace_fatmax"])
+
+    # ---- 4. Célpont meghatározása (Fatmax vagy személyes medián)
+    # HR: ha van Fatmax, az a felső plafon; ha nincs, HRmax%-alapú
+    if pd.notna(fatmax_hr):
+        # Easy = Fatmax alatt, ~5–8%-kal lassabb mint Fatmax
+        hr_center = fatmax_hr * 0.94
+    elif pd.notna(hr_med):
+        hr_center = hr_med
+    else:
+        hr_center = hrmax * (CFG["easy_target_hr_pct_lo"] + CFG["easy_target_hr_pct_hi"]) / 2
+
+    # Pace: ha van Fatmax tempó, abból számolunk (kicsit lassabb)
+    if pd.notna(fatmax_pace_sec):
+        pace_center_sec = fatmax_pace_sec * 1.06  # ~6% lassabb mint Fatmax
+    elif pd.notna(pace_med_sec):
+        pace_center_sec = pace_med_sec
+    else:
+        pace_center_sec = np.nan
+
+    # Power: ha van Fatmax, kicsit kisebb power
+    if pd.notna(fatmax_pwr):
+        pwr_center = fatmax_pwr * 0.92
+    elif pd.notna(pwr_med):
+        pwr_center = pwr_med
+    else:
+        pwr_center = np.nan
+
+    # ---- 5. Fáradtság-korrekció
+    current_fatigue = np.nan
+    fatigue_penalty_factor = 0.0  # 0 = nincs korrekció
+
+    if fatigue_col and fatigue_col in base.columns and base[fatigue_col].notna().any():
+        last_run = base.dropna(subset=[fatigue_col]).iloc[-1]
+        current_fatigue = float(last_run[fatigue_col])
+
+        # Alapszint: 40 alatti fatigue = nincs módosítás
+        # Minden 10 pont felett → egyre konzervatívabb zóna
+        fatigue_above_base = max(0.0, current_fatigue - 40.0)
+        fatigue_penalty_factor = fatigue_above_base / 10.0
+
+    hr_penalty = CFG["easy_fatigue_penalty_hr"] * fatigue_penalty_factor
+    pace_penalty = CFG["easy_fatigue_penalty_pace"] * fatigue_penalty_factor
+    pwr_penalty = CFG["easy_fatigue_penalty_pwr"] * fatigue_penalty_factor
+
+    # Korrigált középérték
+    hr_adj = hr_center - hr_penalty
+    pace_adj_sec = pace_center_sec + pace_penalty if pd.notna(pace_center_sec) else np.nan
+    pwr_adj = pwr_center - pwr_penalty if pd.notna(pwr_center) else np.nan
+
+    # ---- 6. Célsávok (±band)
+    band_hr = CFG["easy_target_band_hr"]
+    band_pace = CFG["easy_target_band_pace"]
+    band_pwr = CFG["easy_target_band_pwr"]
+
+    hr_lo = round(hr_adj - band_hr)
+    hr_hi = round(hr_adj + band_hr)
+
+    pace_lo_sec = pace_adj_sec - band_pace if pd.notna(pace_adj_sec) else np.nan
+    pace_hi_sec = pace_adj_sec + band_pace if pd.notna(pace_adj_sec) else np.nan
+
+    pwr_lo = round(pwr_adj - band_pwr) if pd.notna(pwr_adj) else np.nan
+    pwr_hi = round(pwr_adj + band_pwr) if pd.notna(pwr_adj) else np.nan
+
+    # ---- 7. HRmax% ellenőrzés (ne menjen ki az aerob tartományból)
+    hr_lo = max(hr_lo, round(hrmax * CFG["easy_target_hr_pct_lo"]))
+    hr_hi = min(hr_hi, round(hrmax * CFG["easy_target_hr_pct_hi"]))
+
+    # ---- 8. Státusz és napszöveg
+    if pd.notna(current_fatigue):
+        if current_fatigue >= 70:
+            readiness_status = "🔴"
+            readiness_text = "Nagy fáradtság – nagyon konzervatív easy, vagy pihenőnap"
+        elif current_fatigue >= 50:
+            readiness_status = "🟠"
+            readiness_text = "Közepes fáradtság – legyen valóban könnyű, ne csábulj gyorsabb tempóra"
+        elif current_fatigue >= 30:
+            readiness_status = "🟡"
+            readiness_text = "Normál állapot – klasszikus easy, a zónát tartsd be"
+        else:
+            readiness_status = "🟢"
+            readiness_text = "Friss állapot – a zóna betartásával akár kicsit több km is mehet"
+    else:
+        readiness_status = "⚪"
+        readiness_text = "Fatigue adat nélkül ez a személyes easy medián alapján számolt zóna"
+
+    return {
+        # Célsávok
+        "hr_lo": hr_lo,
+        "hr_hi": hr_hi,
+        "pace_lo": sec_to_pace_str(pace_lo_sec),
+        "pace_hi": sec_to_pace_str(pace_hi_sec),
+        "pwr_lo": pwr_lo,
+        "pwr_hi": pwr_hi,
+        # Középértékek (debug / részletek)
+        "hr_center": round(hr_adj, 1),
+        "pace_center": sec_to_pace_str(pace_adj_sec),
+        "pwr_center": round(pwr_adj, 1) if pd.notna(pwr_adj) else np.nan,
+        # Forrásadatok
+        "fatmax_hr": fatmax_hr,
+        "fatmax_pace": sec_to_pace_str(fatmax_pace_sec),
+        "fatmax_pwr": fatmax_pwr,
+        "hr_med_easy": hr_med,
+        "pace_med_easy": sec_to_pace_str(pace_med_sec),
+        "pwr_med_easy": pwr_med,
+        # Korrekció
+        "current_fatigue": current_fatigue,
+        "fatigue_penalty_factor": round(fatigue_penalty_factor, 2),
+        "hr_penalty": round(hr_penalty, 1),
+        "pace_penalty_sec": round(pace_penalty, 1),
+        "pwr_penalty": round(pwr_penalty, 1),
+        # Státusz
+        "readiness_status": readiness_status,
+        "readiness_text": readiness_text,
+        # Historikus trend (utolsó 30 easy futás HR vs zóna)
+        "easy_history": easy_bl.tail(30)[
+            [c for c in ["Dátum", hr_col, "pace_sec_km", pwr_col, fatigue_col]
+             if c and c in easy_bl.columns]
+        ].copy() if len(easy_bl) >= 5 else pd.DataFrame(),
+    }
 
 
 # =========================================================
@@ -1521,6 +1745,9 @@ run_type_col = find_col(d, "Run_type")
 fatigue_col = find_col(d, "Fatigue_score")
 fatigue_type_col = find_col(d, "Fatigue_type")
 slope_col = find_col(d, "slope_bucket")
+hr_col = find_col(d, "hr_num", "Átlagos pulzusszám")
+pace_col = find_col(d, "Átlagos tempó")
+pwr_col = find_col(d, "power_avg_w", "Átl. teljesítmény")
 
 if run_type_col:
     d["Edzés típusa"] = d[run_type_col].apply(run_type_hu)
@@ -1626,6 +1853,197 @@ tab_overview, tab_last, tab_warn, tab_ready, tab_pmc, tab_recovery, tab_asym, ta
 # TAB: ÁTTEKINTÉS
 # =========================================================
 with tab_overview:
+
+    # =========================================================
+    # 🏃 EASY RUN TARGET – mai állapot alapján
+    # =========================================================
+    st.subheader("🏃 Easy run target – mai állapot")
+
+    _et = compute_easy_target(
+        df=d,
+        hrmax=hrmax,
+        fatigue_col=fatigue_col,
+        run_type_col=run_type_col,
+        hr_col=hr_col,
+        pace_col=pace_col,
+        pwr_col=pwr_col,
+        baseline_weeks=baseline_weeks,
+        baseline_min_runs=baseline_min_runs,
+    )
+
+    if _et is None:
+        st.info("Easy run target-hez legalább 5 easy futás szükséges HR adattal.")
+    else:
+        # --- Státusz banner
+        rs = _et["readiness_status"]
+        rt = _et["readiness_text"]
+        if rs == "🔴":
+            st.error(f"{rs} {rt}")
+        elif rs == "🟠":
+            st.warning(f"{rs} {rt}")
+        elif rs == "🟡":
+            st.warning(f"{rs} {rt}")
+        else:
+            st.success(f"{rs} {rt}")
+
+        # --- Fő célsáv kártyák
+        st.markdown("#### 🎯 Mai easy zóna")
+        _c1, _c2, _c3 = st.columns(3)
+
+        with _c1:
+            st.markdown(
+                f"""
+                <div style="background:#1a1a2e;border-radius:14px;padding:18px 20px;text-align:center;">
+                  <div style="font-size:0.85rem;color:#aaa;margin-bottom:4px;">❤️ Pulzus</div>
+                  <div style="font-size:2rem;font-weight:700;color:#e74c3c;">
+                    {_et['hr_lo']}–{_et['hr_hi']}
+                  </div>
+                  <div style="font-size:0.9rem;color:#aaa;">bpm</div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
+        with _c2:
+            st.markdown(
+                f"""
+                <div style="background:#1a1a2e;border-radius:14px;padding:18px 20px;text-align:center;">
+                  <div style="font-size:0.85rem;color:#aaa;margin-bottom:4px;">⏱️ Tempó</div>
+                  <div style="font-size:2rem;font-weight:700;color:#3498db;">
+                    {_et['pace_lo']}–{_et['pace_hi']}
+                  </div>
+                  <div style="font-size:0.9rem;color:#aaa;">min/km</div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
+        with _c3:
+            if pd.notna(_et["pwr_lo"]) and pd.notna(_et["pwr_hi"]):
+                _pwr_str = f"{int(_et['pwr_lo'])}–{int(_et['pwr_hi'])}"
+                _pwr_unit = "W"
+            else:
+                _pwr_str = "—"
+                _pwr_unit = "nincs power adat"
+            st.markdown(
+                f"""
+                <div style="background:#1a1a2e;border-radius:14px;padding:18px 20px;text-align:center;">
+                  <div style="font-size:0.85rem;color:#aaa;margin-bottom:4px;">⚡ Teljesítmény</div>
+                  <div style="font-size:2rem;font-weight:700;color:#2ecc71;">
+                    {_pwr_str}
+                  </div>
+                  <div style="font-size:0.9rem;color:#aaa;">{_pwr_unit}</div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
+        st.markdown("<br>", unsafe_allow_html=True)
+
+        # --- Fáradtság-korrekció részletei
+        if pd.notna(_et["current_fatigue"]) and _et["fatigue_penalty_factor"] > 0:
+            with st.expander(
+                f"📉 Fáradtság-korrekció alkalmazva "
+                f"(Fatigue: {_et['current_fatigue']:.0f} → "
+                f"−{_et['hr_penalty']:.1f} bpm / "
+                f"+{_et['pace_penalty_sec']:.0f} sec/km / "
+                f"−{_et['pwr_penalty']:.0f} W)"
+            ):
+                _col1, _col2 = st.columns(2)
+                with _col1:
+                    st.markdown("**Számítás alapja**")
+                    st.markdown(f"- Jelenlegi Fatigue_score: **{_et['current_fatigue']:.0f}**")
+                    st.markdown(f"- Korrekciós szorzó: **{_et['fatigue_penalty_factor']:.1f}×**")
+                    st.markdown(f"- HR korrekció: **−{_et['hr_penalty']:.1f} bpm**")
+                    st.markdown(f"- Tempó korrekció: **+{_et['pace_penalty_sec']:.0f} sec/km**")
+                    if pd.notna(_et["pwr_penalty"]) and _et["pwr_penalty"] > 0:
+                        st.markdown(f"- Power korrekció: **−{_et['pwr_penalty']:.0f} W**")
+                with _col2:
+                    st.markdown("**Forrásadatok**")
+                    if pd.notna(_et["fatmax_hr"]):
+                        st.markdown(f"- Fatmax HR: **{_et['fatmax_hr']:.0f} bpm** ({_et['fatmax_pace']} min/km)")
+                    if pd.notna(_et["hr_med_easy"]):
+                        st.markdown(f"- Easy medián HR: **{_et['hr_med_easy']:.0f} bpm**")
+                    if pd.notna(_et["pace_med_easy"]) and _et["pace_med_easy"] != "—":
+                        st.markdown(f"- Easy medián tempó: **{_et['pace_med_easy']} min/km**")
+                    if pd.notna(_et["pwr_med_easy"]):
+                        st.markdown(f"- Easy medián power: **{_et['pwr_med_easy']:.0f} W**")
+        else:
+            with st.expander("ℹ️ Számítás részletei"):
+                if pd.notna(_et["fatmax_hr"]):
+                    st.markdown(f"- Fatmax HR: **{_et['fatmax_hr']:.0f} bpm** ({_et['fatmax_pace']} min/km)")
+                if pd.notna(_et["hr_med_easy"]):
+                    st.markdown(f"- Easy medián HR: **{_et['hr_med_easy']:.0f} bpm**")
+                if pd.notna(_et["pace_med_easy"]) and _et["pace_med_easy"] != "—":
+                    st.markdown(f"- Easy medián tempó: **{_et['pace_med_easy']} min/km**")
+                if pd.notna(_et["pwr_med_easy"]):
+                    st.markdown(f"- Easy medián power: **{_et['pwr_med_easy']:.0f} W**")
+                st.markdown(f"- Jelenlegi Fatigue: **{_et['current_fatigue']:.0f}** → nincs korrekció")
+
+        # --- Historikus easy futások vs célsáv
+        if not _et["easy_history"].empty and hr_col and hr_col in _et["easy_history"].columns:
+            st.markdown("#### 📊 Legutóbbi easy futások HR vs. mai célsáv")
+            _hist = _et["easy_history"].copy()
+            _hist["HR"] = pd.to_numeric(_hist[hr_col], errors="coerce")
+            _hist = _hist.dropna(subset=["Dátum", "HR"])
+
+            if len(_hist) >= 3:
+                fig_et = px.scatter(
+                    _hist,
+                    x="Dátum",
+                    y="HR",
+                    labels={"Dátum": "Dátum", "HR": "Átlag HR (bpm)"},
+                    title="Easy futások átlag HR-je – célsávhoz viszonyítva",
+                    color_discrete_sequence=["#3498db"],
+                    opacity=0.75,
+                )
+                # Célsáv jelölése
+                fig_et.add_hrect(
+                    y0=_et["hr_lo"], y1=_et["hr_hi"],
+                    fillcolor="green", opacity=0.12,
+                    annotation_text=f"Mai célsáv ({_et['hr_lo']}–{_et['hr_hi']} bpm)",
+                    annotation_position="top left",
+                )
+                # Rolling átlag
+                _hist_sorted = _hist.sort_values("Dátum")
+                if len(_hist_sorted) >= 6:
+                    _hist_sorted["roll_hr"] = _hist_sorted["HR"].rolling(6, min_periods=3).mean()
+                    fig_et.add_scatter(
+                        x=_hist_sorted["Dátum"],
+                        y=_hist_sorted["roll_hr"],
+                        mode="lines",
+                        name="6 futás átlag",
+                        line=dict(color="white", dash="dot", width=2),
+                    )
+                st.plotly_chart(fig_et, use_container_width=True)
+
+                # Pace trend ha van
+                if "pace_sec_km" in _hist.columns and _hist["pace_sec_km"].notna().any():
+                    _hist["Tempó (sec/km)"] = pd.to_numeric(_hist["pace_sec_km"], errors="coerce")
+                    _pace_lo = pace_str_to_sec(_et["pace_lo"])
+                    _pace_hi = pace_str_to_sec(_et["pace_hi"])
+                    fig_pace_et = px.scatter(
+                        _hist.dropna(subset=["Tempó (sec/km)"]),
+                        x="Dátum",
+                        y="Tempó (sec/km)",
+                        labels={"Dátum": "Dátum", "Tempó (sec/km)": "Tempó (sec/km)"},
+                        title="Easy futások tempója – célsávhoz viszonyítva",
+                        color_discrete_sequence=["#e67e22"],
+                        opacity=0.75,
+                    )
+                    if pd.notna(_pace_lo) and pd.notna(_pace_hi):
+                        fig_pace_et.add_hrect(
+                            y0=_pace_lo, y1=_pace_hi,
+                            fillcolor="green", opacity=0.12,
+                            annotation_text=f"Mai tempó célsáv ({_et['pace_lo']}–{_et['pace_hi']})",
+                            annotation_position="top left",
+                        )
+                    # Y tengely: alacsonyabb sec/km = gyorsabb, fordított skálán jobb lenne
+                    fig_pace_et.update_yaxes(autorange="reversed")
+                    st.plotly_chart(fig_pace_et, use_container_width=True)
+
+    st.divider()
+
     # --- Napi coach összefoglalás
     st.subheader("🗓️ Napi összkép (coach)")
     status, msg = daily_coach_summary(
