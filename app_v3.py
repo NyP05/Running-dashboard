@@ -2359,9 +2359,10 @@ view = d.loc[mask].copy().sort_values("Dátum")
 # =========================================================
 # TABOK
 # =========================================================
-tab_overview, tab_last, tab_warn, tab_ready, tab_pmc, tab_recovery, tab_asym, tab_data = st.tabs(
+tab_overview, tab_last, tab_warn, tab_ready, tab_pmc, tab_recovery, tab_asym, tab_strava, tab_data = st.tabs(
     ["📌 Áttekintés", "🔎 Utolsó futás", "🚦 Warning", "🏁 Readiness",
-     "📈 PMC & Kockázat", "🔄 Recovery", "⚖️ Aszimmetria", "📄 Adatok"]
+     "📈 PMC & Kockázat", "🔄 Recovery", "⚖️ Aszimmetria",
+     "🟠 Strava adatok", "📄 Adatok"]
 )
 
 # =========================================================
@@ -3874,7 +3875,299 @@ with tab_asym:
 # =========================================================
 # TAB: ADATOK
 # =========================================================
-with tab_data:
+# =========================================================
+# TAB: STRAVA ADATOK
+# =========================================================
+with tab_strava:
+    st.subheader("🟠 Strava adatok – részletes nézet")
+
+    if _data_source == "garmin":
+        st.info(
+            "Ez a tab Strava csatlakozás esetén aktív. "
+            "Jelenleg Garmin CSV módban fut az app – "
+            "csatlakozz Stravához a bal oldali sávban."
+        )
+    else:
+        # ── Utolsó futás nyers Strava JSON ──────────────────────────
+        st.markdown("### 🔍 Utolsó futás – nyers Strava mezők")
+        st.caption(
+            "Ez mutatja pontosan mit küld át a Strava API egy futásnál. "
+            "Látható melyik mező van meg és melyik hiányzik."
+        )
+
+        access_token = st.session_state.get("strava_access_token")
+        if access_token:
+            # Legutóbbi 1 futás letöltése részletesen
+            last_act = _strava_get(
+                "/athlete/activities",
+                access_token,
+                params={"per_page": 5, "page": 1},
+            )
+            run_acts = [a for a in (last_act or [])
+                        if a.get("sport_type", a.get("type", "")) in
+                        ("Run", "TrailRun", "VirtualRun", "Race", "Workout")]
+
+            if run_acts:
+                # Futás választó
+                options = {
+                    f"{a.get('start_date_local','')[:10]}  –  {a.get('name','?')}  "
+                    f"({a.get('distance',0)/1000:.1f} km)": a
+                    for a in run_acts
+                }
+                chosen_label = st.selectbox(
+                    "Melyik futást nézzük?",
+                    options=list(options.keys()),
+                    key="strava_debug_sel",
+                )
+                act = options[chosen_label]
+
+                # ── 1. Összefoglaló kártyák ──────────────────────────
+                st.markdown("#### 📊 Összefoglaló")
+                _c = st.columns(4)
+                _c[0].metric("Távolság", f"{act.get('distance',0)/1000:.2f} km")
+                _c[1].metric("Idő", f"{int(act.get('moving_time',0)//60)} perc")
+                hr_v = act.get("average_heartrate")
+                _c[2].metric("Átlag HR", f"{hr_v:.0f} bpm" if hr_v else "—")
+                cad_v = act.get("average_cadence")
+                _c[3].metric("Kadencia", f"{cad_v*2:.0f} spm" if cad_v else "—")
+
+                _c2 = st.columns(4)
+                spd = act.get("average_speed", 0)
+                pace_s = 1000/spd if spd > 0 else None
+                _c2[0].metric("Tempó", sec_to_pace_str(pace_s) + " /km" if pace_s else "—")
+                _c2[1].metric("Emelkedés", f"{act.get('total_elevation_gain',0):.0f} m")
+                pwr_v = act.get("average_watts")
+                _c2[2].metric("Átlag power", f"{pwr_v:.0f} W" if pwr_v else "—")
+                suf = act.get("suffer_score")
+                _c2[3].metric("Suffer score", f"{suf}" if suf else "—")
+
+                st.divider()
+
+                # ── 2. Mezők: Van / Nincs táblázat ──────────────────
+                st.markdown("#### ✅ Strava mezők – mi érkezett meg?")
+
+                STRAVA_FIELDS = {
+                    # Alapadatok
+                    "name":                     ("Cím / aktivitás neve", "alap"),
+                    "start_date_local":         ("Dátum (helyi idő)", "alap"),
+                    "distance":                 ("Távolság (m)", "alap"),
+                    "moving_time":              ("Mozgási idő (s)", "alap"),
+                    "elapsed_time":             ("Eltelt idő (s)", "alap"),
+                    "total_elevation_gain":     ("Emelkedés (m)", "alap"),
+                    "sport_type":               ("Sport típusa", "alap"),
+                    "average_speed":            ("Átlag sebesség (m/s)", "alap"),
+                    "max_speed":                ("Max sebesség (m/s)", "alap"),
+                    # Szív és erőfeszítés
+                    "average_heartrate":        ("Átlag pulzus (bpm)", "szív"),
+                    "max_heartrate":            ("Max pulzus (bpm)", "szív"),
+                    "suffer_score":             ("Suffer score", "szív"),
+                    "perceived_exertion":       ("Érzett erőfeszítés (1-10)", "szív"),
+                    # Futótechnika
+                    "average_cadence":          ("Átlag kadencia (jobb láb/perc)", "technika"),
+                    "average_watts":            ("Átlag teljesítmény (W)", "technika"),
+                    "max_watts":                ("Max teljesítmény (W)", "technika"),
+                    "weighted_average_watts":   ("Súlyozott átlag W (NP)", "technika"),
+                    "device_watts":             ("Valódi power mérő?", "technika"),
+                    # Elhelyezkedés
+                    "start_latlng":             ("Indulási koordináta", "helyszín"),
+                    "end_latlng":               ("Érkezési koordináta", "helyszín"),
+                    "map":                      ("GPS térkép (polyline)", "helyszín"),
+                    # Egyéb
+                    "average_temp":             ("Hőmérséklet (°C)", "egyéb"),
+                    "calories":                 ("Kalória", "egyéb"),
+                    "kudos_count":              ("Kudos szám", "egyéb"),
+                    "achievement_count":        ("Teljesítmények száma", "egyéb"),
+                    "pr_count":                 ("Személyes rekordok száma", "egyéb"),
+                    "gear_id":                  ("Cipő / eszköz ID", "egyéb"),
+                    "trainer":                  ("Futópad?", "egyéb"),
+                    "commute":                  ("Ingázás?", "egyéb"),
+                    # Garminban van, Stravában NINCS
+                    "vertical_oscillation":     ("⛔ Függőleges oszcilláció (VO)", "hiányzik"),
+                    "ground_contact_time":      ("⛔ Talajérintési idő (GCT)", "hiányzik"),
+                    "vertical_ratio":           ("⛔ Függőleges arány (VR)", "hiányzik"),
+                    "stride_length":            ("⛔ Lépéshossz", "hiányzik"),
+                    "left_right_balance":       ("⛔ Bal/jobb egyensúly", "hiányzik"),
+                }
+
+                rows_debug = []
+                for field, (label, category) in STRAVA_FIELDS.items():
+                    val = act.get(field)
+                    has_val = val is not None and val != "" and val != []
+
+                    if category == "hiányzik":
+                        status_icon = "❌"
+                        display_val = "Nincs Strava API-ban"
+                    elif has_val:
+                        status_icon = "✅"
+                        # Formázott érték
+                        if field == "distance":
+                            display_val = f"{float(val)/1000:.3f} km"
+                        elif field == "average_speed":
+                            pace_sec = 1000 / float(val) if float(val) > 0 else None
+                            display_val = f"{sec_to_pace_str(pace_sec)} /km ({float(val):.2f} m/s)"
+                        elif field == "moving_time" or field == "elapsed_time":
+                            m, s = divmod(int(val), 60)
+                            h, m = divmod(m, 60)
+                            display_val = f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
+                        elif field == "average_cadence":
+                            display_val = f"{float(val)*2:.0f} spm (Strava: {float(val):.1f} × 2)"
+                        elif field == "map":
+                            display_val = "✓ GPS útvonal megvan (polyline)"
+                        elif field == "start_latlng" or field == "end_latlng":
+                            display_val = f"{val[0]:.5f}, {val[1]:.5f}" if val else "—"
+                        else:
+                            display_val = str(val)
+                    else:
+                        status_icon = "⚠️"
+                        display_val = "Nincs adat (None)"
+
+                    rows_debug.append({
+                        "": status_icon,
+                        "Strava mező": field,
+                        "Magyar név": label,
+                        "Kategória": category,
+                        "Érték": display_val,
+                    })
+
+                df_debug = pd.DataFrame(rows_debug)
+
+                # Kategória szűrő
+                cats = ["összes"] + sorted(df_debug["Kategória"].unique().tolist())
+                sel_cat = st.radio(
+                    "Kategória szűrő",
+                    options=cats,
+                    horizontal=True,
+                    key="strava_cat_filter",
+                )
+                if sel_cat != "összes":
+                    df_debug = df_debug[df_debug["Kategória"] == sel_cat]
+
+                # Csak megvan / hiányzik szűrő
+                col_f1, col_f2 = st.columns(2)
+                show_missing = col_f1.checkbox("⚠️ Hiányzók megjelenítése", value=True)
+                show_garmin_only = col_f2.checkbox("❌ Garmin-only mezők", value=True)
+                if not show_missing:
+                    df_debug = df_debug[df_debug[""] != "⚠️"]
+                if not show_garmin_only:
+                    df_debug = df_debug[df_debug[""] != "❌"]
+
+                st.dataframe(
+                    df_debug,
+                    use_container_width=True,
+                    hide_index=True,
+                    height=420,
+                    column_config={
+                        "": st.column_config.TextColumn(width="small"),
+                        "Strava mező": st.column_config.TextColumn(width="medium"),
+                        "Magyar név": st.column_config.TextColumn(width="large"),
+                        "Kategória": st.column_config.TextColumn(width="small"),
+                        "Érték": st.column_config.TextColumn(width="large"),
+                    }
+                )
+
+                # ── 3. Összefoglaló számok ───────────────────────────
+                n_ok   = (df_debug[""] == "✅").sum()
+                n_warn = (df_debug[""] == "⚠️").sum()
+                n_miss = (df_debug[""] == "❌").sum()
+                st.caption(
+                    f"✅ {n_ok} mező megvan  |  "
+                    f"⚠️ {n_warn} mező hiányzik (de lekérhető lenne)  |  "
+                    f"❌ {n_miss} mező Garmin-only (Strava API-ban nincs)"
+                )
+
+                st.divider()
+
+                # ── 4. Teljes nyers JSON ─────────────────────────────
+                with st.expander("🔩 Teljes nyers Strava JSON (fejlesztői nézet)"):
+                    # Érzékeny mezők maszkolása
+                    safe_act = {k: v for k, v in act.items()
+                                if k not in ("map",)}  # polyline nem kell
+                    if "map" in act:
+                        safe_act["map"] = {"summary_polyline": "...(elrejtve)..."}
+                    st.json(safe_act)
+
+                st.divider()
+
+                # ── 5. Mit tud és mit nem a dashboard Strava módban ──
+                st.markdown("#### 📋 Dashboard képességek Strava vs Garmin módban")
+                capability_data = {
+                    "Funkció": [
+                        "ACWR / TSS / CTL / ATL / TSB",
+                        "Easy Run Target (HR + tempó)",
+                        "Easy Run Target (power)",
+                        "Ramp rate & heti terhelés",
+                        "Fatmax becslés",
+                        "Aerobic decoupling",
+                        "Recovery time modell",
+                        "Technika_index",
+                        "Fatigue_score",
+                        "RES+ (Running Economy Score)",
+                        "Aszimmetria elemzés",
+                        "Slope-aware elemzés",
+                        "Hőmérséklet-korrekció",
+                    ],
+                    "🟠 Strava": [
+                        "✅ Teljes",
+                        "✅ HR alapon",
+                        "✅ ha van power mérő",
+                        "✅ Teljes",
+                        "✅ HR + tempó alapon",
+                        "✅ HR + tempó alapon",
+                        "⚠️ Korlátozott (Fatigue hiány)",
+                        "❌ GCT/VO/VR hiányzik",
+                        "❌ GCT/VO/VR hiányzik",
+                        "⚠️ Részleges (HR/power alapon)",
+                        "❌ Bal/jobb adat hiányzik",
+                        "⚠️ Csak emelkedés alapján",
+                        "✅ ha van hőmérséklet adat",
+                    ],
+                    "📂 Garmin CSV": [
+                        "✅ Teljes",
+                        "✅ Teljes",
+                        "✅ Teljes",
+                        "✅ Teljes",
+                        "✅ Teljes",
+                        "✅ Teljes",
+                        "✅ Teljes",
+                        "✅ Teljes",
+                        "✅ Teljes",
+                        "✅ Teljes",
+                        "✅ ha Running Dynamics van",
+                        "✅ Teljes",
+                        "✅ Teljes",
+                    ],
+                    "🔀 Hibrid (mindkettő)": [
+                        "✅ Teljes",
+                        "✅ Teljes",
+                        "✅ Teljes",
+                        "✅ Teljes",
+                        "✅ Teljes",
+                        "✅ Teljes",
+                        "✅ Teljes",
+                        "✅ Teljes",
+                        "✅ Teljes",
+                        "✅ Teljes",
+                        "✅ Teljes",
+                        "✅ Teljes",
+                        "✅ Teljes",
+                    ],
+                }
+                st.dataframe(
+                    pd.DataFrame(capability_data),
+                    use_container_width=True,
+                    hide_index=True,
+                    height=490,
+                )
+
+            else:
+                st.info("Nem találtam futós aktivitást az utolsó 5 aktivitás között.")
+        else:
+            st.warning("Strava access token nem elérhető – lehet hogy lejárt a session. Frissítsd az oldalt.")
+
+
+# =========================================================
+# TAB: ADATOK
+# =========================================================
     st.subheader("📄 Adatok (szűrve)")
     st.caption("A szűrt futások teljes adattáblája. Az elemzésekhez elég az első 4 tab.")
     st.dataframe(view, use_container_width=True, hide_index=True, height=520)
