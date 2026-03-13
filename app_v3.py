@@ -2381,10 +2381,10 @@ view = d.loc[mask].copy().sort_values("Dátum")
 # =========================================================
 # TABOK
 # =========================================================
-tab_overview, tab_last, tab_warn, tab_ready, tab_pmc, tab_recovery, tab_asym, tab_strava, tab_data = st.tabs(
+tab_overview, tab_last, tab_warn, tab_ready, tab_pmc, tab_recovery, tab_asym, tab_strava, tab_strava_analysis, tab_data = st.tabs(
     ["📌 Áttekintés", "🔎 Utolsó futás", "🚦 Warning", "🏁 Readiness",
      "📈 PMC & Kockázat", "🔄 Recovery", "⚖️ Aszimmetria",
-     "🟠 Strava adatok", "📄 Adatok"]
+     "🟠 Strava adatok", "🟠 Strava elemzés", "📄 Adatok"]
 )
 
 # =========================================================
@@ -3895,9 +3895,6 @@ with tab_asym:
 
 
 # =========================================================
-# TAB: ADATOK
-# =========================================================
-# =========================================================
 # TAB: STRAVA ADATOK
 # =========================================================
 with tab_strava:
@@ -4188,8 +4185,337 @@ with tab_strava:
 
 
 # =========================================================
+# TAB: STRAVA ELEMZÉS
+# =========================================================
+with tab_strava_analysis:
+    st.subheader("🟠 Strava elemzés – csak Strava adatok alapján")
+    st.caption("Távolság, tempó, HR, kadencia, emelkedés, suffer score – mind a Strava API-ból.")
+
+    if _data_source == "garmin":
+        st.info("Ez az elemzés Strava csatlakozás esetén aktív. Csatlakozz Stravához a bal oldali sávban.")
+    else:
+        _s = view.copy()
+        _has_hr   = "hr_num" in _s.columns and _s["hr_num"].notna().sum() >= 3
+        _has_pace = "pace_sec_km" in _s.columns and _s["pace_sec_km"].notna().sum() >= 3
+        _has_cad  = "cad_num" in _s.columns and _s["cad_num"].notna().sum() >= 3
+        _has_pwr  = "power_avg_w" in _s.columns and _s["power_avg_w"].notna().sum() >= 3
+        _has_asc  = "asc_m" in _s.columns and _s["asc_m"].notna().sum() >= 3
+        _has_suf  = "suffer_score" in _s.columns and _s["suffer_score"].notna().sum() >= 3
+        _has_dist = "dist_km" in _s.columns and _s["dist_km"].notna().sum() >= 3
+
+        # ── 1. KPI sor ──────────────────────────────────────────
+        st.markdown("### 📊 Összesítők")
+        _k = st.columns(5)
+        _k[0].metric("Futások", f"{len(_s)}")
+        _k[1].metric("Össz távolság",
+                     f"{_s['dist_km'].sum():.0f} km" if _has_dist else "—")
+        _k[2].metric("Össz idő",
+                     f"{_s['dur_sec'].sum()/3600:.1f} h" if "dur_sec" in _s.columns else "—")
+        _k[3].metric("Átlag HR",
+                     f"{_s['hr_num'].mean():.0f} bpm" if _has_hr else "—")
+        _k[4].metric("Össz emelkedés",
+                     f"{_s['asc_m'].sum():.0f} m" if _has_asc else "—")
+
+        st.divider()
+
+        # ── 2. Tempó fejlődés ──────────────────────────────────
+        if _has_pace and _has_dist:
+            st.markdown("### 📈 Tempó fejlődés időben")
+            _sp = _s[_s["pace_sec_km"].notna() & (_s["pace_sec_km"] > 0)].copy()
+            _sp["tempó_label"] = _sp["pace_sec_km"].apply(sec_to_pace_str)
+            _sp["pace_inv"] = 1000 / _sp["pace_sec_km"]
+
+            _col1, _col2 = st.columns([3, 1])
+            with _col1:
+                fig_pace = px.scatter(
+                    _sp, x="Dátum", y="pace_inv",
+                    size="dist_km", size_max=18,
+                    color="hr_num" if _has_hr else None,
+                    color_continuous_scale="RdYlGn_r",
+                    hover_data={"tempó_label": True, "dist_km": ":.1f",
+                                "hr_num": _has_hr, "pace_inv": False},
+                    labels={"pace_inv": "Sebesség (km/h)", "dist_km": "Táv (km)", "hr_num": "HR"},
+                    title="Sebesség időben  (méretarány = távolság, szín = HR)",
+                )
+                if len(_sp) >= 8:
+                    _sp2 = _sp.sort_values("Dátum").copy()
+                    _sp2["roll"] = _sp2["pace_inv"].rolling(8, min_periods=4).mean()
+                    for tr in px.line(_sp2, x="Dátum", y="roll",
+                                      color_discrete_sequence=["#1a73e8"]).data:
+                        tr.name = "8 futós átlag"; tr.showlegend = True
+                        fig_pace.add_trace(tr)
+                fig_pace.update_yaxes(tickformat=".2f")
+                st.plotly_chart(fig_pace, use_container_width=True)
+            with _col2:
+                st.markdown("**Tempó statisztika**")
+                for lbl, val in [
+                    ("Leggyorsabb", sec_to_pace_str(_sp["pace_sec_km"].min())),
+                    ("Leglassabb",  sec_to_pace_str(_sp["pace_sec_km"].max())),
+                    ("Medián",      sec_to_pace_str(float(_sp["pace_sec_km"].median()))),
+                    ("Utolsó 5 átl.", sec_to_pace_str(float(_sp.tail(5)["pace_sec_km"].mean()))),
+                ]:
+                    st.metric(lbl, val + " /km")
+
+            st.divider()
+
+        # ── 3. HR–Tempó – aerob hatékonyság ────────────────────
+        if _has_hr and _has_pace:
+            st.markdown("### ❤️ HR vs Tempó – aerob hatékonyság")
+            st.caption("Minél lejjebb-jobbra egy pont, annál jobb: gyorsabb tempó alacsonyabb HR-rel.")
+            _ht = _s[_s["hr_num"].notna() & _s["pace_sec_km"].notna() &
+                     (_s["pace_sec_km"] > 0)].copy()
+            _ht["pace_inv"] = 1000 / _ht["pace_sec_km"]
+            hr_med = float(_ht["hr_num"].median())
+            _ht["hr_zone"] = pd.cut(
+                _ht["hr_num"],
+                bins=[0, hr_med*0.80, hr_med*0.90, hr_med*1.0, hr_med*1.08, 999],
+                labels=["Z1 Nagyon könnyű", "Z2 Könnyű", "Z3 Aerob", "Z4 Küszöb", "Z5 Intenzív"],
+            )
+            fig_ht = px.scatter(
+                _ht, x="hr_num", y="pace_inv",
+                color="hr_zone",
+                size="dist_km" if _has_dist else None, size_max=16,
+                hover_data={"Dátum": "|%Y-%m-%d", "dist_km": ":.1f"},
+                labels={"hr_num": "Átlag HR (bpm)", "pace_inv": "Sebesség (km/h)", "hr_zone": "Zóna"},
+                color_discrete_sequence=px.colors.qualitative.Safe,
+                title="HR vs Sebesség (zóna szerint színezve)",
+            )
+            _x_ht = _ht["hr_num"].to_numpy(dtype=float)
+            _y_ht = _ht["pace_inv"].to_numpy(dtype=float)
+            _mk = np.isfinite(_x_ht) & np.isfinite(_y_ht)
+            if _mk.sum() >= 5:
+                _cf = np.polyfit(_x_ht[_mk], _y_ht[_mk], 1)
+                _xl = np.linspace(_x_ht[_mk].min(), _x_ht[_mk].max(), 50)
+                fig_ht.add_scatter(x=_xl, y=np.polyval(_cf, _xl), mode="lines",
+                                   name="Trend", line=dict(color="gray", dash="dash", width=1.5))
+            st.plotly_chart(fig_ht, use_container_width=True)
+
+            _ht["aei"] = _ht["pace_inv"] / _ht["hr_num"] * 100
+            _n3 = max(1, len(_ht)//3)
+            _aei_first = float(_ht.head(_n3)["aei"].mean())
+            _aei_last  = float(_ht.tail(_n3)["aei"].mean())
+            _aei_delta = _aei_last - _aei_first
+            _ac1, _ac2, _ac3 = st.columns(3)
+            _ac1.metric("AEI – első harmad",  f"{_aei_first:.2f}")
+            _ac2.metric("AEI – utolsó harmad", f"{_aei_last:.2f}", delta=f"{_aei_delta:+.2f}")
+            _ac3.metric("Trend",
+                        "📈 Javuló" if _aei_delta > 0.05 else
+                        "📉 Romló"  if _aei_delta < -0.05 else "➡️ Stabil")
+
+            st.divider()
+
+        # ── 4. Heti volumen & ramp rate ────────────────────────
+        if _has_dist:
+            st.markdown("### 📅 Heti volumen & ramp rate")
+            _sw = _s.copy()
+            _sw["hét"] = _sw["Dátum"].dt.to_period("W").dt.start_time
+            _weekly = _sw.groupby("hét").agg(
+                km=("dist_km", "sum"),
+                futások=("dist_km", "count"),
+                hr_avg=("hr_num", "mean"),
+                asc=("asc_m", "sum"),
+            ).reset_index()
+            _weekly["prev_km"] = _weekly["km"].shift(1)
+            _weekly["ramp"] = ((_weekly["km"] - _weekly["prev_km"])
+                               / _weekly["prev_km"].replace(0, np.nan) * 100)
+
+            _wc1, _wc2 = st.columns(2)
+            with _wc1:
+                fig_wk = px.bar(_weekly, x="hét", y="km",
+                                color="hr_avg" if _has_hr else None,
+                                color_continuous_scale="RdYlGn_r",
+                                labels={"km": "Heti km", "hét": "", "hr_avg": "Átlag HR"},
+                                title="Heti futott kilométerek")
+                st.plotly_chart(fig_wk, use_container_width=True)
+            with _wc2:
+                _ramp_df = _weekly.dropna(subset=["ramp"]).copy()
+                if len(_ramp_df) >= 3:
+                    _ramp_df["szín"] = _ramp_df["ramp"].apply(
+                        lambda r: "piros" if r > CFG["ramp_red"]
+                        else "sárga" if r > CFG["ramp_warn"] else "zöld"
+                    )
+                    fig_ramp = px.bar(_ramp_df, x="hét", y="ramp", color="szín",
+                                      color_discrete_map={"piros": "#e74c3c",
+                                                          "sárga": "#f39c12", "zöld": "#2ecc71"},
+                                      title="Heti ramp rate (%)",
+                                      labels={"ramp": "Ramp (%)", "hét": ""})
+                    fig_ramp.add_hline(y=CFG["ramp_warn"], line_dash="dot",
+                                       line_color="orange", annotation_text="Figyelj (8%)")
+                    fig_ramp.add_hline(y=CFG["ramp_red"], line_dash="dot",
+                                       line_color="red", annotation_text="Veszélyes (12%)")
+                    st.plotly_chart(fig_ramp, use_container_width=True)
+                else:
+                    st.info("Ramp rate-hez legalább 4 hét adat kell.")
+
+            st.divider()
+
+        # ── 5. Kadencia ────────────────────────────────────────
+        if _has_cad:
+            st.markdown("### 🦵 Kadencia elemzés")
+            _sc = _s[_s["cad_num"].notna() & (_s["cad_num"] > 100)].copy()
+            _cc1, _cc2 = st.columns(2)
+            with _cc1:
+                fig_cad = px.scatter(
+                    _sc, x="Dátum", y="cad_num",
+                    color="hr_num" if _has_hr else None,
+                    color_continuous_scale="RdYlGn_r",
+                    title="Kadencia időben",
+                    labels={"cad_num": "Kadencia (spm)", "hr_num": "HR"},
+                )
+                fig_cad.add_hline(y=170, line_dash="dot", line_color="orange",
+                                  annotation_text="170 spm ajánlott alsó")
+                fig_cad.add_hline(y=180, line_dash="dot", line_color="green",
+                                  annotation_text="180 spm optimum")
+                if len(_sc) >= 8:
+                    _sc2 = _sc.sort_values("Dátum").copy()
+                    _sc2["roll"] = _sc2["cad_num"].rolling(8, min_periods=4).mean()
+                    for tr in px.line(_sc2, x="Dátum", y="roll",
+                                      color_discrete_sequence=["#1a73e8"]).data:
+                        tr.name = "8 futós átlag"; fig_cad.add_trace(tr)
+                st.plotly_chart(fig_cad, use_container_width=True)
+            with _cc2:
+                fig_cad_hist = px.histogram(_sc, x="cad_num", nbins=20,
+                                            title="Kadencia eloszlás",
+                                            labels={"cad_num": "Kadencia (spm)"},
+                                            color_discrete_sequence=["#3498db"])
+                fig_cad_hist.add_vline(x=180, line_dash="dash", line_color="green",
+                                       annotation_text="180 spm")
+                st.plotly_chart(fig_cad_hist, use_container_width=True)
+            _cad_ok = (_sc["cad_num"] >= 170).mean() * 100
+            _cdc1, _cdc2, _cdc3 = st.columns(3)
+            _cdc1.metric("Átlag kadencia",   f"{_sc['cad_num'].mean():.0f} spm")
+            _cdc2.metric("Medián kadencia",  f"{_sc['cad_num'].median():.0f} spm")
+            _cdc3.metric("Futások 170+ spm", f"{_cad_ok:.0f}%")
+            st.divider()
+
+        # ── 6. Emelkedés ───────────────────────────────────────
+        if _has_asc and _has_dist:
+            st.markdown("### ⛰️ Emelkedés és terep")
+            _sa = _s[_s["dist_km"].notna() & (_s["dist_km"] > 0)].copy()
+            _sa["emelkedés/km"] = _sa["asc_m"] / _sa["dist_km"]
+            _asc1, _asc2 = st.columns(2)
+            with _asc1:
+                fig_asc = px.scatter(
+                    _sa, x="dist_km", y="asc_m",
+                    color="pace_sec_km" if _has_pace else None,
+                    color_continuous_scale="RdYlGn",
+                    size="dur_sec" if "dur_sec" in _sa.columns else None, size_max=18,
+                    hover_data={"Dátum": "|%Y-%m-%d", "emelkedés/km": ":.1f"},
+                    title="Emelkedés vs távolság",
+                    labels={"dist_km": "Távolság (km)", "asc_m": "Emelkedés (m)"},
+                )
+                st.plotly_chart(fig_asc, use_container_width=True)
+            with _asc2:
+                if "slope_bucket" in _sa.columns:
+                    _terep = _sa["slope_bucket"].apply(slope_bucket_hu).value_counts().reset_index()
+                    _terep.columns = ["Terep", "Futások"]
+                    fig_terep = px.pie(_terep, values="Futások", names="Terep",
+                                       title="Terep megoszlás",
+                                       color_discrete_sequence=px.colors.qualitative.Safe)
+                    st.plotly_chart(fig_terep, use_container_width=True)
+            st.divider()
+
+        # ── 7. Suffer Score ────────────────────────────────────
+        if _has_suf:
+            st.markdown("### 😤 Suffer Score – edzésterhelés")
+            _ss = _s[_s["suffer_score"].notna() & (_s["suffer_score"] > 0)].copy()
+            _sfc1, _sfc2 = st.columns(2)
+            with _sfc1:
+                fig_suf = px.bar(_ss.sort_values("Dátum"), x="Dátum", y="suffer_score",
+                                 color="suffer_score", color_continuous_scale="RdYlGn_r",
+                                 title="Suffer Score futásonként",
+                                 labels={"suffer_score": "Suffer Score"})
+                if len(_ss) >= 6:
+                    _ss2 = _ss.sort_values("Dátum").copy()
+                    _ss2["roll"] = _ss2["suffer_score"].rolling(6, min_periods=3).mean()
+                    for tr in px.line(_ss2, x="Dátum", y="roll",
+                                      color_discrete_sequence=["#2c3e50"]).data:
+                        tr.name = "6 futós átlag"; fig_suf.add_trace(tr)
+                st.plotly_chart(fig_suf, use_container_width=True)
+            with _sfc2:
+                if _has_hr:
+                    fig_suf_hr = px.scatter(
+                        _ss, x="hr_num", y="suffer_score",
+                        size="dist_km" if _has_dist else None, size_max=16,
+                        color="pace_sec_km" if _has_pace else None,
+                        color_continuous_scale="RdYlGn",
+                        title="HR vs Suffer Score",
+                        labels={"hr_num": "Átlag HR (bpm)", "suffer_score": "Suffer Score"},
+                    )
+                    _x_sf = _ss["hr_num"].to_numpy(dtype=float)
+                    _y_sf = _ss["suffer_score"].to_numpy(dtype=float)
+                    _mf = np.isfinite(_x_sf) & np.isfinite(_y_sf)
+                    if _mf.sum() >= 5:
+                        _cf2 = np.polyfit(_x_sf[_mf], _y_sf[_mf], 1)
+                        _xl2 = np.linspace(_x_sf[_mf].min(), _x_sf[_mf].max(), 50)
+                        fig_suf_hr.add_scatter(x=_xl2, y=np.polyval(_cf2, _xl2),
+                                               mode="lines", name="Trend",
+                                               line=dict(color="gray", dash="dash"))
+                    st.plotly_chart(fig_suf_hr, use_container_width=True)
+                else:
+                    fig_suf_hist = px.histogram(_ss, x="suffer_score", nbins=15,
+                                                title="Suffer Score eloszlás",
+                                                color_discrete_sequence=["#e74c3c"])
+                    st.plotly_chart(fig_suf_hist, use_container_width=True)
+            _sk1, _sk2, _sk3, _sk4 = st.columns(4)
+            _sk1.metric("Átlag",  f"{_ss['suffer_score'].mean():.0f}")
+            _sk2.metric("Max",    f"{_ss['suffer_score'].max():.0f}")
+            _sk3.metric("Össz",   f"{_ss['suffer_score'].sum():.0f}")
+            _sk4.metric("Intenzív (>50)", f"{(_ss['suffer_score'] > 50).sum()}")
+            st.divider()
+
+        # ── 8. Power (Stryd) ───────────────────────────────────
+        if _has_pwr:
+            st.markdown("### ⚡ Power – futás-gazdaságosság (Stryd)")
+            _sp_p = _s[_s["power_avg_w"].notna() & (_s["power_avg_w"] > 0)].copy()
+            _pw1, _pw2 = st.columns(2)
+            with _pw1:
+                fig_pwr = px.scatter(
+                    _sp_p, x="Dátum", y="power_avg_w",
+                    size="dist_km" if _has_dist else None, size_max=18,
+                    color="hr_num" if _has_hr else None,
+                    color_continuous_scale="RdYlGn_r",
+                    title="Átlag power időben",
+                    labels={"power_avg_w": "Power (W)", "hr_num": "HR"},
+                )
+                if len(_sp_p) >= 8:
+                    _sp_p2 = _sp_p.sort_values("Dátum").copy()
+                    _sp_p2["roll"] = _sp_p2["power_avg_w"].rolling(8, min_periods=4).mean()
+                    for tr in px.line(_sp_p2, x="Dátum", y="roll",
+                                      color_discrete_sequence=["#8e44ad"]).data:
+                        tr.name = "8 futós átlag"; fig_pwr.add_trace(tr)
+                st.plotly_chart(fig_pwr, use_container_width=True)
+            with _pw2:
+                if _has_hr:
+                    _sp_p["pw_hr"] = _sp_p["power_avg_w"] / _sp_p["hr_num"]
+                    fig_pwhr = px.scatter(
+                        _sp_p, x="Dátum", y="pw_hr",
+                        title="Power/HR arány (futás-gazdaságosság proxy)",
+                        labels={"pw_hr": "W/bpm"},
+                        color_discrete_sequence=["#27ae60"],
+                    )
+                    if len(_sp_p) >= 8:
+                        _sp_p["roll_r"] = _sp_p["pw_hr"].rolling(8, min_periods=4).mean()
+                        for tr in px.line(_sp_p, x="Dátum", y="roll_r",
+                                          color_discrete_sequence=["#2c3e50"]).data:
+                            tr.name = "Trend"; fig_pwhr.add_trace(tr)
+                    st.plotly_chart(fig_pwhr, use_container_width=True)
+
+        # ── 9. Hiányzó adatok figyelmeztetése ──────────────────
+        _miss = [n for n, h in [("Pulzus (HR)", _has_hr), ("Kadencia", _has_cad),
+                                 ("Power (Stryd)", _has_pwr), ("Suffer Score", _has_suf)]
+                 if not h]
+        if _miss:
+            st.info(
+                f"⚠️ Hiányzó adatok ebben az időszakban: **{', '.join(_miss)}**. "
+                f"Pulzusmérő és Stryd eszközök bővítik az elemzést."
+            )
+
+
+# =========================================================
 # TAB: ADATOK
 # =========================================================
+with tab_data:
     st.subheader("📄 Adatok (szűrve)")
     st.caption("A szűrt futások teljes adattáblája. Az elemzésekhez elég az első 4 tab.")
     st.dataframe(view, use_container_width=True, hide_index=True, height=520)
