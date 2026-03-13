@@ -106,15 +106,15 @@ _STRAVA_FIELD_MAP = {
 
 
 def _strava_secrets() -> tuple[str | None, str | None, str | None]:
-    """Visszaadja a (client_id, client_secret, redirect_uri) hármast a Secrets-ből."""
-    cid = st.secrets.get("STRAVA_CLIENT_ID", None)
-    csec = st.secrets.get("STRAVA_CLIENT_SECRET", None)
-    ruri = st.secrets.get("STRAVA_REDIRECT_URI", None)
-    return cid, csec, ruri
+    """Visszaadja a (client_id, client_secret, refresh_token) hármast a Secrets-ből."""
+    cid   = st.secrets.get("STRAVA_CLIENT_ID", None)
+    csec  = st.secrets.get("STRAVA_CLIENT_SECRET", None)
+    rtok  = st.secrets.get("STRAVA_REFRESH_TOKEN", None)
+    return cid, csec, rtok
 
 
 def strava_auth_url(client_id: str, redirect_uri: str) -> str:
-    """Generálja az OAuth2 authorization URL-t."""
+    """Generálja az OAuth2 authorization URL-t (csak a helper scripthez kell)."""
     params = {
         "client_id": client_id,
         "redirect_uri": redirect_uri,
@@ -126,7 +126,7 @@ def strava_auth_url(client_id: str, redirect_uri: str) -> str:
 
 
 def strava_exchange_code(client_id: str, client_secret: str, code: str) -> dict | None:
-    """Authorization code → access + refresh token csere."""
+    """Authorization code → access + refresh token csere (helper scripthez)."""
     payload = urllib.parse.urlencode({
         "client_id": client_id,
         "client_secret": client_secret,
@@ -334,130 +334,116 @@ def strava_activities_to_df(activities: list[dict]) -> pd.DataFrame:
     return df
 
 
-def get_valid_strava_token(client_id: str, client_secret: str) -> str | None:
+def get_valid_strava_token(client_id: str, client_secret: str, refresh_tok: str) -> str | None:
     """
     Visszaadja az érvényes access_token-t.
-    Ha lejárt, automatikusan megújítja a refresh_token-nel.
-    A tokeneket st.session_state-ben tárolja.
+    - Ha a session_state-ben van és még érvényes → visszaadja
+    - Ha lejárt vagy nincs → refresh_token-nel megújítja
+    A refresh_token a Secrets-ből jön (állandó), az access_token session-szintű.
     """
     ss = st.session_state
-    if "strava_access_token" not in ss:
-        return None
-
     expires_at = ss.get("strava_token_expires_at", 0)
     now_ts = int(time.time())
 
-    # Ha még legalább 5 percig érvényes, visszaadjuk
-    if now_ts < expires_at - 300:
+    if "strava_access_token" in ss and now_ts < expires_at - 300:
         return ss["strava_access_token"]
 
-    # Megújítás
-    refresh_tok = ss.get("strava_refresh_token")
-    if not refresh_tok:
-        return None
-
+    # Megújítás a Secrets-beli refresh_token-nel
     new_tokens = strava_refresh_token(client_id, client_secret, refresh_tok)
-    if not new_tokens:
+    if not new_tokens or "access_token" not in new_tokens:
         return None
 
-    ss["strava_access_token"] = new_tokens["access_token"]
-    ss["strava_refresh_token"] = new_tokens["refresh_token"]
-    ss["strava_token_expires_at"] = new_tokens["expires_at"]
+    ss["strava_access_token"]      = new_tokens["access_token"]
+    ss["strava_token_expires_at"]  = new_tokens["expires_at"]
+    # Ha a Strava új refresh_token-t ad (ritka), azt is mentjük session-be
+    if "refresh_token" in new_tokens:
+        ss["strava_session_refresh"] = new_tokens["refresh_token"]
+
     return ss["strava_access_token"]
 
 
 def render_strava_connect_sidebar():
     """
-    Strava kapcsolat UI a sidebarban.
-    Kezeli: nincs secret → magyarázat | nincs token → connect gomb |
-            van token → kapcsolt státusz + szinkron gomb + lecsatlakozás.
-    Visszatér: (strava_df | None, source_label)
+    Strava kapcsolat UI a sidebarban – refresh_token alapú (nincs OAuth redirect).
+
+    Állapotok:
+      - Nincs secret → útmutató a get_strava_token.py scripthez
+      - Van secret, de token hiba → hibaüzenet
+      - Minden OK → kapcsolt állapot + szinkron gomb
     """
-    client_id, client_secret, redirect_uri = _strava_secrets()
+    client_id, client_secret, refresh_tok = _strava_secrets()
 
     st.sidebar.divider()
     st.sidebar.header("🟠 Strava kapcsolat")
 
-    # ---- Nincs secret beállítva
-    if not client_id or not client_secret:
-        st.sidebar.info(
-            "Strava integrációhoz add hozzá a Streamlit Secrets-hez:\n\n"
+    # ---- Nincs secret
+    if not client_id or not client_secret or not refresh_tok:
+        missing = []
+        if not client_id:      missing.append("STRAVA_CLIENT_ID")
+        if not client_secret:  missing.append("STRAVA_CLIENT_SECRET")
+        if not refresh_tok:    missing.append("STRAVA_REFRESH_TOKEN")
+
+        st.sidebar.warning(
+            f"Hiányzó Secrets: **{', '.join(missing)}**\n\n"
+            "**Lépések:**\n"
+            "1. Töltsd le a `get_strava_token.py` scriptet\n"
+            "2. Futtasd a saját gépeden → megkapod a refresh_token-t\n"
+            "3. Add hozzá a Streamlit Secrets-hez:\n\n"
             "```toml\n"
-            "STRAVA_CLIENT_ID = \"123456\"\n"
+            "STRAVA_CLIENT_ID     = \"123456\"\n"
             "STRAVA_CLIENT_SECRET = \"abc...\"\n"
-            "STRAVA_REDIRECT_URI = \"https://app.url\"\n"
-            "```\n\n"
-            "([Strava API alkalmazás létrehozása](https://www.strava.com/settings/api))"
+            "STRAVA_REFRESH_TOKEN = \"def...\"\n"
+            "```"
         )
         return None, "garmin"
 
-    # ---- Callback: URL-ben van ?code= (OAuth visszairányítás után)
-    query = st.query_params
-    if "code" in query and "strava_access_token" not in st.session_state:
-        code = query["code"]
-        with st.spinner("Strava kapcsolódás..."):
-            tokens = strava_exchange_code(client_id, client_secret, code)
-        if tokens and "access_token" in tokens:
-            st.session_state["strava_access_token"] = tokens["access_token"]
-            st.session_state["strava_refresh_token"] = tokens["refresh_token"]
-            st.session_state["strava_token_expires_at"] = tokens["expires_at"]
-            athlete = tokens.get("athlete", {})
-            st.session_state["strava_athlete_name"] = (
-                f"{athlete.get('firstname', '')} {athlete.get('lastname', '')}".strip()
-            )
-            # Töröljük a code-ot az URL-ből
-            st.query_params.clear()
-            st.rerun()
-        else:
-            st.sidebar.error("Strava csatlakozás sikertelen.")
-            st.query_params.clear()
+    # ---- Token megszerzése / megújítása
+    # Session-szintű refresh_token (ha a Strava újat adott) vagy a Secrets-beli
+    effective_refresh = st.session_state.get("strava_session_refresh", refresh_tok)
 
-    # ---- Nincs token → Connect gomb
-    if "strava_access_token" not in st.session_state:
-        auth_url = strava_auth_url(client_id, redirect_uri)
-        st.sidebar.markdown(
-            f'<a href="{auth_url}" target="_self">'
-            f'<button style="background:#FC4C02;color:white;border:none;'
-            f'border-radius:8px;padding:10px 18px;font-size:1rem;'
-            f'cursor:pointer;width:100%;">🔗 Csatlakozás Stravához</button>'
-            f'</a>',
-            unsafe_allow_html=True,
-        )
-        return None, "garmin"
+    with st.spinner("Strava kapcsolat ellenőrzése…") if "strava_access_token" not in st.session_state else st.sidebar:
+        access_token = get_valid_strava_token(client_id, client_secret, effective_refresh)
 
-    # ---- Van token → kapcsolt állapot
-    access_token = get_valid_strava_token(client_id, client_secret)
     if not access_token:
-        st.sidebar.warning("Strava token lejárt – csatlakozz újra.")
-        del st.session_state["strava_access_token"]
-        st.rerun()
+        st.sidebar.error(
+            "❌ Strava kapcsolat sikertelen.\n\n"
+            "Lehetséges okok:\n"
+            "- A STRAVA_REFRESH_TOKEN lejárt vagy érvénytelen\n"
+            "- Futtasd újra a `get_strava_token.py` scriptet\n"
+            "- Ellenőrizd a Client ID / Secret értékeket"
+        )
+        return None, "garmin"
 
-    athlete_name = st.session_state.get("strava_athlete_name", "Strava felhasználó")
+    # ---- Kapcsolt állapot
+    # Athlete neve: ha még nem töltöttük le, lekérjük egyszer
+    if "strava_athlete_name" not in st.session_state:
+        athlete_data = _strava_get("/athlete", access_token)
+        if athlete_data:
+            st.session_state["strava_athlete_name"] = (
+                f"{athlete_data.get('firstname', '')} "
+                f"{athlete_data.get('lastname', '')}".strip()
+            )
+
+    athlete_name = st.session_state.get("strava_athlete_name", "Strava sportoló")
     st.sidebar.success(f"✅ Kapcsolódva: **{athlete_name}**")
 
-    # Szinkron időszak választó
+    # Szinkron időszak
     days_back = st.sidebar.selectbox(
         "Szinkron időszak",
         options=[90, 180, 365, 730],
         index=2,
-        format_func=lambda d: {90: "3 hónap", 180: "6 hónap", 365: "1 év", 730: "2 év"}[d],
+        format_func=lambda d: {90: "3 hónap", 180: "6 hónap",
+                                365: "1 év",   730: "2 év"}[d],
         key="strava_days_back",
     )
 
-    # Frissítés gomb (cache törlés + újratöltés)
+    # Kézi frissítés gomb
     if st.sidebar.button("🔄 Strava adatok frissítése", key="strava_refresh_btn"):
         fetch_strava_activities.clear()
+        st.session_state.pop("strava_access_token", None)  # force token újra
         st.rerun()
 
-    # Lecsatlakozás
-    if st.sidebar.button("⛓️ Strava lecsatlakozás", key="strava_disconnect"):
-        for k in ["strava_access_token", "strava_refresh_token",
-                  "strava_token_expires_at", "strava_athlete_name"]:
-            st.session_state.pop(k, None)
-        fetch_strava_activities.clear()
-        st.rerun()
-
-    # Letöltés
+    # Letöltés (30 perces cache)
     activities = fetch_strava_activities(access_token, days_back=days_back)
     if not activities:
         st.sidebar.warning("Nem találtam futást a megadott időszakban.")
