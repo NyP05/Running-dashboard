@@ -578,12 +578,16 @@ def robust_z(x: pd.Series, ref: pd.Series) -> pd.Series:
 def _safe_dropna(df: pd.DataFrame, subset: list[str]) -> pd.DataFrame:
     """
     dropna mint a pandas-é, de csak a ténylegesen létező oszlopokra alkalmazza.
-    Hiányzó oszlopot csendben kihagyja – nem dob KeyError-t.
-    Strava módban (pl. Technika_index hiányzik) így nem omlik össze az app.
+    Ha egy oszlop nem létezik a df-ben, azt a szűrési feltételt kihagyja.
+    Strava módban (pl. Technika_index hiányzik) így nem dob KeyError-t,
+    és az eredmény egy üres df lesz ha az egyetlen subset-col hiányzik.
     """
     existing = [c for c in subset if c in df.columns]
-    if not existing:
-        return df
+    missing  = [c for c in subset if c not in df.columns]
+    if missing:
+        # Ha legalább egy kötelező oszlop hiányzik teljesen,
+        # adjunk vissza üres df-et (nem tudunk érvényes sorokat szűrni)
+        return df.iloc[0:0].copy()
     return df.dropna(subset=existing)
 
 
@@ -793,6 +797,11 @@ def daily_coach_summary(
 ) -> tuple[str, str]:
     if base_all is None or len(base_all) == 0:
         return "ℹ️", "Nincs elég adat a napi összképhez."
+
+    # Strava módban Technika_index nem létezik → nincs coach üzenet
+    if "Technika_index" not in base_all.columns or base_all["Technika_index"].notna().sum() < 5:
+        return "ℹ️", "Technika_index nem elérhető (Strava módban GCT/VO/VR hiányzik). Tölts fel Garmin exportot is a teljes elemzéshez."
+
     b = _safe_dropna(base_all, ["Dátum", "Technika_index"]).sort_values("Dátum")
     if len(b) < 5:
         return "ℹ️", "Nincs elég technika adat (legalább ~5 futás kell)."
