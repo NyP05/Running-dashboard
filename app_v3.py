@@ -575,6 +575,18 @@ def robust_z(x: pd.Series, ref: pd.Series) -> pd.Series:
     return (x - med) / (1.4826 * mad)
 
 
+def _safe_dropna(df: pd.DataFrame, subset: list[str]) -> pd.DataFrame:
+    """
+    dropna mint a pandas-é, de csak a ténylegesen létező oszlopokra alkalmazza.
+    Hiányzó oszlopot csendben kihagyja – nem dob KeyError-t.
+    Strava módban (pl. Technika_index hiányzik) így nem omlik össze az app.
+    """
+    existing = [c for c in subset if c in df.columns]
+    if not existing:
+        return df
+    return df.dropna(subset=existing)
+
+
 # safe_col és _col_any egyesítve egyetlen függvénybe
 def find_col(df: pd.DataFrame, *candidates: str) -> str | None:
     """Visszaadja az első létező oszlopnevet a candidates listából."""
@@ -760,7 +772,7 @@ def get_easy_baseline(
         if "Run_type" in base_df.columns
         else base_df.copy()
     )
-    easy = easy.dropna(subset=["Dátum", "Technika_index"]).sort_values("Dátum")
+    easy = _safe_dropna(easy, ["Dátum", "Technika_index"]).sort_values("Dátum")
     if pd.isna(last_date):
         return easy.tail(min_runs).copy()
     start = last_date - pd.Timedelta(weeks=weeks)
@@ -781,7 +793,7 @@ def daily_coach_summary(
 ) -> tuple[str, str]:
     if base_all is None or len(base_all) == 0:
         return "ℹ️", "Nincs elég adat a napi összképhez."
-    b = base_all.dropna(subset=["Dátum", "Technika_index"]).sort_values("Dátum")
+    b = _safe_dropna(base_all, ["Dátum", "Technika_index"]).sort_values("Dátum")
     if len(b) < 5:
         return "ℹ️", "Nincs elég technika adat (legalább ~5 futás kell)."
     easy = (
@@ -789,7 +801,7 @@ def daily_coach_summary(
         if run_type_col and run_type_col in b.columns
         else b.copy()
     )
-    easy = easy.dropna(subset=["Dátum", "Technika_index"]).sort_values("Dátum")
+    easy = _safe_dropna(easy, ["Dátum", "Technika_index"]).sort_values("Dátum")
     if len(easy) < 5:
         return "ℹ️", "Kevés easy futás → a napi összkép bizonytalan."
     last_easy = easy.iloc[-1]
@@ -1404,7 +1416,7 @@ def compute_recovery_model(
     """
     if "Technika_index" not in df.columns or fatigue_col not in df.columns:
         return None
-    base = df.dropna(subset=["Dátum", "Technika_index", fatigue_col]).sort_values("Dátum").copy()
+    base = _safe_dropna(df, ["Dátum", "Technika_index", fatigue_col]).sort_values("Dátum").copy()
     if len(base) < min_events * 3:
         return None
 
@@ -2782,7 +2794,7 @@ with tab_overview:
         st.subheader("📈 Technika_index időben")
         if "Technika_index" in view.columns and view["Technika_index"].notna().sum() >= 3:
             fig = px.scatter(
-                view.dropna(subset=["Technika_index"]),
+                _safe_dropna(view, ["Technika_index"]),
                 x="Dátum",
                 y="Technika_index",
                 color="Edzés típusa" if "Edzés típusa" in view.columns else None,
@@ -2819,7 +2831,7 @@ with tab_overview:
             and view["Technika_index"].notna().sum() >= 10
             and view[fatigue_col].notna().sum() >= 10
         ):
-            dd = view.dropna(subset=["Technika_index", fatigue_col]).copy()
+            dd = _safe_dropna(view, ["Technika_index", fatigue_col]).copy()
             tech_med = float(np.nanmedian(dd["Technika_index"]))
             fat_med = float(np.nanmedian(dd[fatigue_col]))
             fig2 = px.scatter(
@@ -2842,7 +2854,7 @@ with tab_overview:
     with cB:
         st.subheader("🧭 Terhelés vs Technika (heti trend)")
         if "Technika_index" in d.columns:
-            w_tt = d.dropna(subset=["Dátum", "Technika_index"]).copy()
+            w_tt = _safe_dropna(d, ["Dátum", "Technika_index"]).copy()
             w_tt["week_start"] = w_tt["Dátum"].dt.to_period("W").dt.start_time
             w_tt["week"] = w_tt["week_start"].dt.strftime("%Y-%m-%d")
 
@@ -2913,7 +2925,7 @@ with tab_last:
     if "Technika_index" not in d.columns:
         st.info("Nincs Technika_index – az utolsó futás technika elemzéséhez számított index kell.")
     else:
-        base = d.dropna(subset=["Dátum", "Technika_index"]).sort_values("Dátum")
+        base = _safe_dropna(d, ["Dátum", "Technika_index"]).sort_values("Dátum")
         if len(base) == 0:
             st.info("Nincs elég adat (Dátum + Technika_index).")
         else:
@@ -3167,7 +3179,7 @@ with tab_warn:
             n_yellow = colC.slider("N easy futás (SÁRGA ablak)", 3, 20, 5, key="wr_n_yellow")
             need_yellow = colC.slider("Minimum találat (SÁRGA)", 1, 20, 2, key="wr_need_yellow")
 
-        warn_base = d.dropna(subset=["Dátum", "Technika_index"]).sort_values("Dátum")
+        warn_base = _safe_dropna(d, ["Dátum", "Technika_index"]).sort_values("Dátum")
         easy_w = (
             warn_base[warn_base[run_type_col] == "easy"].copy()
             if run_type_col
@@ -3233,7 +3245,7 @@ with tab_ready:
     if run_type_col is None or fatigue_col is None or "Technika_index" not in d.columns:
         st.info("Readiness-hez kell Edzés típusa + Fatigue_score + Technika_index.")
     else:
-        ready_base = d.dropna(subset=["Dátum", "Technika_index"]).sort_values("Dátum")
+        ready_base = _safe_dropna(d, ["Dátum", "Technika_index"]).sort_values("Dátum")
         easy_r = ready_base[ready_base[run_type_col] == "easy"].dropna(subset=[fatigue_col]).copy()
 
         if len(easy_r) < 10:
@@ -3653,7 +3665,7 @@ with tab_recovery:
 
             # --- Recovery görbék: technika alakulása esemény után
             st.markdown("#### 📉 Technika alakulása magas-Fatigue esemény után")
-            base_rec = d.dropna(subset=["Dátum", "Technika_index", fatigue_col]).sort_values("Dátum").copy()
+            base_rec = _safe_dropna(d, ["Dátum", "Technika_index", fatigue_col]).sort_values("Dátum").copy()
             events_rec = base_rec[base_rec[fatigue_col] > 65].copy()
             if len(events_rec) < 3:
                 thr_r = np.nanpercentile(base_rec[fatigue_col], 75)
