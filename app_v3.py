@@ -243,10 +243,12 @@ def strava_activities_to_df(activities: list[dict]) -> pd.DataFrame:
             pace_sec_km = np.nan
             pace_str = np.nan
 
-        # Dátum
+        # Dátum – tz-naive-ra normalizálva (Garmin CSV-vel való kompatibilitáshoz)
         date_raw = a.get("start_date_local", a.get("start_date", ""))
         try:
             dt = pd.to_datetime(date_raw, utc=False, errors="coerce")
+            if dt is not pd.NaT and dt.tzinfo is not None:
+                dt = dt.tz_convert("UTC").tz_localize(None)
         except Exception:
             dt = pd.NaT
 
@@ -2158,11 +2160,23 @@ def _merge_strava_garmin(strava_df: pd.DataFrame, garmin_df: pd.DataFrame) -> pd
     if garmin_df.empty:
         return strava_df
 
-    # Mindkét df-ben: Dátum → date (nap szinten egyeztetjük)
     s = strava_df.copy()
     g = garmin_df.copy()
-    s["_date"] = pd.to_datetime(s["Dátum"]).dt.date
-    g["_date"] = pd.to_datetime(g["Dátum"]).dt.date
+
+    # ── Timezone normalizálás: mindkettőt timezone-naive UTC-re hozzuk ──
+    # Strava: lehet tz-aware (pl. 2024-01-15 08:30:00+01:00)
+    # Garmin: tz-naive
+    # Megoldás: mindkettőből eltávolítjuk a timezone infót (.dt.tz_localize(None))
+    for _df in (s, g):
+        if "Dátum" in _df.columns:
+            dt = pd.to_datetime(_df["Dátum"], errors="coerce")
+            if dt.dt.tz is not None:
+                dt = dt.dt.tz_convert("UTC").dt.tz_localize(None)
+            _df["Dátum"] = dt
+
+    # Nap-szintű egyeztetés
+    s["_date"] = s["Dátum"].dt.date
+    g["_date"] = g["Dátum"].dt.date
 
     # Garmin Running Dynamics oszlopok amik hiányoznak Stravából
     rd_cols = [c for c in ["vr_num", "gct_num", "vo_num", "stride_num",
@@ -2172,7 +2186,6 @@ def _merge_strava_garmin(strava_df: pd.DataFrame, garmin_df: pd.DataFrame) -> pd
     if rd_cols:
         g_rd = g[["_date"] + rd_cols].copy()
         s = s.merge(g_rd, on="_date", how="left", suffixes=("", "_garmin"))
-        # Ha a Strava sorban NaN volt a RD mező, töltsük fel Garmin értékkel
         for col in rd_cols:
             garmin_col = f"{col}_garmin"
             if garmin_col in s.columns:
@@ -2181,8 +2194,8 @@ def _merge_strava_garmin(strava_df: pd.DataFrame, garmin_df: pd.DataFrame) -> pd
 
     s.drop(columns=["_date"], inplace=True, errors="ignore")
 
-    # Garmin-only sorok hozzáadása (napok amik Stravában nem szerepelnek)
-    s_dates = set(pd.to_datetime(s["Dátum"]).dt.date)
+    # Garmin-only sorok (napok amik Stravában nem szerepelnek)
+    s_dates = set(s["Dátum"].dt.date)
     g_only = g[~g["_date"].isin(s_dates)].drop(columns=["_date"], errors="ignore")
     merged = pd.concat([s, g_only], ignore_index=True).sort_values("Dátum")
     return merged
