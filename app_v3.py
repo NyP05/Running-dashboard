@@ -528,14 +528,22 @@ require_password()
 # =========================================================
 
 def to_float_series(s: pd.Series) -> pd.Series:
-    # Ha már numerikus dtype (float/int), nincs szükség string konverzióra
+    # Ha már numerikus dtype (float/int), nincs szükség konverzióra
     if pd.api.types.is_numeric_dtype(s):
         return pd.to_numeric(s, errors="coerce")
-    s = s.astype(str).str.strip()
-    s = s.replace({"--": np.nan, "": np.nan, "None": np.nan})
-    s = s.str.replace(" ", "", regex=False)
-    s = s.str.replace(",", ".", regex=False)
-    return pd.to_numeric(s, errors="coerce")
+    # Object/string: biztonságos konverzió .str nélkül
+    def _conv(v):
+        if v is None or (isinstance(v, float) and np.isnan(v)):
+            return np.nan
+        v = str(v).strip()
+        if v in ("--", "", "None", "nan", "NaN"):
+            return np.nan
+        v = v.replace(" ", "").replace(",", ".")
+        try:
+            return float(v)
+        except ValueError:
+            return np.nan
+    return s.apply(_conv).astype(float)
 
 
 def pace_to_sec_per_km(x):
