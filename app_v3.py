@@ -577,6 +577,98 @@ def robust_z(x: pd.Series, ref: pd.Series) -> pd.Series:
     return (x - med) / (1.4826 * mad)
 
 
+# =========================================================
+# SLOPE-KORREKCIÓ
+# =========================================================
+# Irodalmi alapok (Gottschall & Kram 2005, Snyder & Farley 2011):
+#   - Emelkedőn: VO csökken (~2%/5m·km⁻¹), GCT csökken, lépéshossz nő
+#   - Lejtőn: VO nő, GCT nő, lépéshossz csökken
+#   - VR: emelkedőn kismértékben csökken
+#   - Kadencia: relatíve stabil (±1%/10m·km⁻¹)
+# A korrekció célja: a slope hatását "kivonni" az indexekből,
+# így a Technika/Fatigue/RES értékek terep-függetlenek lesznek.
+
+# Korrekciós együtthatók (minden egység: hatás per m/km emelkedés)
+# Pozitív = az érték nő emelkedőn (pl. VO nő → romlás látszata)
+# Negatív = az érték csökken emelkedőn (pl. GCT csökken → javulás látszata)
+_SLOPE_CORR = {
+    # col        up_coeff    down_coeff  (per m/km)
+    "vo_num":   (+0.040,     -0.030),   # VO: emelkedőn CSÖKKEN, lejtőn NŐ
+    "gct_num":  (-0.300,     +0.200),   # GCT: emelkedőn csökken (ms/m·km⁻¹)
+    "vr_num":   (-0.010,     +0.008),   # VR: emelkedőn kicsit csökken (%)
+    "stride_num": (+0.002,   -0.002),   # Lépéshossz: emelkedőn nő (m)
+    "cad_num":  (-0.008,     +0.006),   # Kadencia: minimális változás
+    "hr_num":   (+0.150,     -0.080),   # HR: emelkedőn nő (bpm/m·km⁻¹)
+    "pace_sec_km": (-2.5,    +1.8),     # Tempó: emelkedőn gyorsabb sec/km érték
+                                        # (kisebb szám = gyorsabb, ezért negatív)
+}
+
+
+def slope_correct_series(
+    series: pd.Series,
+    up_m_per_km: pd.Series,
+    down_m_per_km: pd.Series,
+    col_name: str,
+) -> pd.Series:
+    """
+    Egy adatoszlopból kivonja a terep hatását.
+    Visszaadja a "sík-ekvivalens" értéket.
+
+    Ha col_name nincs a _SLOPE_CORR-ban, változtatás nélkül adja vissza.
+    """
+    if col_name not in _SLOPE_CORR:
+        return series
+    up_c, down_c = _SLOPE_CORR[col_name]
+    up = up_m_per_km.fillna(0).clip(lower=0)
+    down = down_m_per_km.fillna(0).clip(lower=0)
+    correction = up_c * up + down_c * down
+    return series - correction
+
+
+def apply_slope_correction(df: pd.DataFrame, cols: list[str] | None = None) -> pd.DataFrame:
+    """
+    DataFrame-re alkalmazza a slope-korrekciót a megadott (vagy alapértelmezett)
+    oszlopokra. Új oszlopokat hoz létre `_sc` (slope-corrected) suffix-szel.
+
+    Pl.: vo_num → vo_num_sc, gct_num → gct_num_sc
+    """
+    out = df.copy()
+    if "up_m_per_km" not in out.columns or "down_m_per_km" not in out.columns:
+        # Ha nincs terep adat, visszaadja az eredetit (suffix nélkül = alias)
+        for c in (cols or list(_SLOPE_CORR.keys())):
+            if c in out.columns:
+                out[f"{c}_sc"] = out[c]
+        return out
+
+    up = out["up_m_per_km"].fillna(0).clip(lower=0)
+    down = out["down_m_per_km"].fillna(0).clip(lower=0)
+
+    for c in (cols or list(_SLOPE_CORR.keys())):
+        if c not in out.columns:
+            continue
+        up_c, down_c = _SLOPE_CORR[c]
+        correction = up_c * up + down_c * down
+        out[f"{c}_sc"] = out[c] - correction
+
+    return out
+
+
+def slope_correction_summary(up_m_per_km: float, down_m_per_km: float) -> dict:
+    """
+    Megadja, hogy egy adott terep-profilnál mekkora korrekció várható
+    az egyes mutatókra. Debug / magyarázó célra.
+    """
+    up = max(0.0, float(up_m_per_km) if pd.notna(up_m_per_km) else 0.0)
+    down = max(0.0, float(down_m_per_km) if pd.notna(down_m_per_km) else 0.0)
+    result = {}
+    for col, (uc, dc) in _SLOPE_CORR.items():
+        corr = uc * up + dc * down
+        result[col] = round(corr, 3)
+    result["_up_m_per_km"] = up
+    result["_down_m_per_km"] = down
+    return result
+
+
 def _safe_dropna(df: pd.DataFrame, subset: list[str]) -> pd.DataFrame:
     """
     dropna mint a pandas-é, de csak a ténylegesen létező oszlopokra alkalmazza.
@@ -1904,12 +1996,27 @@ def full_pipeline(file_bytes: bytes, file_name: str) -> pd.DataFrame:
     )
 
     # =========================================================
+    # =========================================================
     # TECHNIKA_INDEX (slope-aware + speed bin) – vektorizált
+    # Slope-korrekció: a terep hatását kivonjuk a nyers értékekből,
+    # így az index terep-független "sík-ekvivalens" technikát tükröz.
     # =========================================================
     df["Technika_index"] = np.nan
     tech_base = df[mask_run & df["speed_mps"].notna()].copy()
 
     if len(tech_base) >= CFG["tech_min_total"]:
+        # --- Slope-korrekció alkalmazása ---
+        tech_base = apply_slope_correction(
+            tech_base,
+            cols=["vr_num", "gct_num", "vo_num", "cad_num", "stride_num"]
+        )
+        # A slope-corrected oszlopokat használjuk az index számításhoz
+        _vr   = "vr_num_sc"   if "vr_num_sc"   in tech_base.columns else "vr_num"
+        _gct  = "gct_num_sc"  if "gct_num_sc"  in tech_base.columns else "gct_num"
+        _vo   = "vo_num_sc"   if "vo_num_sc"   in tech_base.columns else "vo_num"
+        _cad  = "cad_num_sc"  if "cad_num_sc"  in tech_base.columns else "cad_num"
+        _str  = "stride_num_sc" if "stride_num_sc" in tech_base.columns else "stride_num"
+
         tech_base["speed_bin"] = pd.qcut(
             tech_base["speed_mps"], q=CFG["speed_bins"], duplicates="drop"
         )
@@ -1919,16 +2026,16 @@ def full_pipeline(file_bytes: bytes, file_name: str) -> pd.DataFrame:
         def _fill_tech_group(g: pd.DataFrame, target: pd.DataFrame):
             idx = g.index
             min_n = CFG["tech_min_group"]
-            if g["vr_num"].notna().sum() >= min_n:
-                target.loc[idx, "skill_vr"] = -robust_z(g["vr_num"], g["vr_num"])
-            if g["gct_num"].notna().sum() >= min_n:
-                target.loc[idx, "skill_gct"] = -robust_z(g["gct_num"], g["gct_num"])
-            if g["vo_num"].notna().sum() >= min_n:
-                target.loc[idx, "skill_vo"] = -robust_z(g["vo_num"], g["vo_num"])
-            if g["cad_num"].notna().sum() >= min_n:
-                target.loc[idx, "skill_cad"] = -np.abs(robust_z(g["cad_num"], g["cad_num"]))
-            if g["stride_num"].notna().sum() >= min_n:
-                target.loc[idx, "skill_stride"] = robust_z(g["stride_num"], g["stride_num"])
+            if g[_vr].notna().sum() >= min_n:
+                target.loc[idx, "skill_vr"] = -robust_z(g[_vr], g[_vr])
+            if g[_gct].notna().sum() >= min_n:
+                target.loc[idx, "skill_gct"] = -robust_z(g[_gct], g[_gct])
+            if g[_vo].notna().sum() >= min_n:
+                target.loc[idx, "skill_vo"] = -robust_z(g[_vo], g[_vo])
+            if g[_cad].notna().sum() >= min_n:
+                target.loc[idx, "skill_cad"] = -np.abs(robust_z(g[_cad], g[_cad]))
+            if g[_str].notna().sum() >= min_n:
+                target.loc[idx, "skill_stride"] = robust_z(g[_str], g[_str])
 
         grouped = tech_base.groupby(["speed_bin", "slope_bucket"], dropna=False)
         for _, g in grouped:
@@ -1965,9 +2072,19 @@ def full_pipeline(file_bytes: bytes, file_name: str) -> pd.DataFrame:
     df["Fatigue_type"] = np.nan
 
     fat = df[mask_run & df["Technika_index"].notna()].copy()
+
+    # --- Slope-korrekció: a HR és GCT/VR értékek terep-hatásának kivonása
+    fat = apply_slope_correction(fat, cols=["gct_num", "vr_num", "cad_num", "hr_num", "pace_sec_km"])
+    _fat_gct  = "gct_num_sc"      if "gct_num_sc"      in fat.columns else "gct_num"
+    _fat_vr   = "vr_num_sc"       if "vr_num_sc"       in fat.columns else "vr_num"
+    _fat_cad  = "cad_num_sc"      if "cad_num_sc"      in fat.columns else "cad_num"
+    _fat_hr   = "hr_num_sc"       if "hr_num_sc"       in fat.columns else "hr_num"
+    _fat_pace = "pace_sec_km_sc"  if "pace_sec_km_sc"  in fat.columns else "pace_sec_km"
+
+    # HR/pace arány: slope-corrected értékekből számoljuk
     fat["hr_per_pace"] = np.where(
-        fat["hr_num"].notna() & fat["pace_sec_km"].notna() & (fat["pace_sec_km"] > 0),
-        fat["hr_num"] / fat["pace_sec_km"],
+        fat[_fat_hr].notna() & fat[_fat_pace].notna() & (fat[_fat_pace] > 0),
+        fat[_fat_hr] / fat[_fat_pace],
         np.nan,
     )
 
@@ -1978,7 +2095,7 @@ def full_pipeline(file_bytes: bytes, file_name: str) -> pd.DataFrame:
             fat_df: pd.DataFrame, easy_df: pd.DataFrame
         ) -> pd.DataFrame:
             """
-            Vektorizált fatigue z-score számítás.
+            Vektorizált fatigue z-score számítás slope-corrected értékekből.
             Minden slope_bucket-hez egy baseline; ha kevés, fallback az egész easy_base.
             """
             result = fat_df.copy()
@@ -1998,10 +2115,10 @@ def full_pipeline(file_bytes: bytes, file_name: str) -> pd.DataFrame:
                 base = _get_base(sb)
                 idx = group.index
 
-                for fat_col, src_col, invert in [
-                    ("fatigue_gct", "gct_num", False),
-                    ("fatigue_vr", "vr_num", False),
-                    ("fatigue_hr", "hr_per_pace", False),
+                for fat_col, src_col in [
+                    ("fatigue_gct", _fat_gct),
+                    ("fatigue_vr",  _fat_vr),
+                    ("fatigue_hr",  "hr_per_pace"),
                 ]:
                     if (
                         group[src_col].notna().sum() >= 5
@@ -2011,10 +2128,10 @@ def full_pipeline(file_bytes: bytes, file_name: str) -> pd.DataFrame:
                         result.loc[idx, fat_col] = z.fillna(0).values
 
                 if (
-                    group["cad_num"].notna().sum() >= 5
-                    and base["cad_num"].notna().sum() >= CFG["fat_min_baseline"]
+                    group[_fat_cad].notna().sum() >= 5
+                    and base[_fat_cad].notna().sum() >= CFG["fat_min_baseline"]
                 ):
-                    z = robust_z(group["cad_num"], base["cad_num"])
+                    z = robust_z(group[_fat_cad], base[_fat_cad])
                     result.loc[idx, "fatigue_cad"] = np.abs(z.fillna(0).values)
 
             return result
@@ -2054,6 +2171,16 @@ def full_pipeline(file_bytes: bytes, file_name: str) -> pd.DataFrame:
     eco = eco.dropna(subset=["Dátum", "speed_mps"])
 
     if len(eco) >= CFG["res_min_total"]:
+        # --- Slope-korrekció a RES+ komponensekre
+        eco = apply_slope_correction(
+            eco, cols=["gct_num", "vr_num", "vo_num", "cad_num", "stride_num"]
+        )
+        _eco_gct    = "gct_num_sc"    if "gct_num_sc"    in eco.columns else "gct_num"
+        _eco_vr     = "vr_num_sc"     if "vr_num_sc"     in eco.columns else "vr_num"
+        _eco_vo     = "vo_num_sc"     if "vo_num_sc"     in eco.columns else "vo_num"
+        _eco_cad    = "cad_num_sc"    if "cad_num_sc"    in eco.columns else "cad_num"
+        _eco_stride = "stride_num_sc" if "stride_num_sc" in eco.columns else "stride_num"
+
         eco["speed_bin"] = pd.qcut(eco["speed_mps"], q=CFG["speed_bins"], duplicates="drop")
         group_cols = ["speed_bin", "slope_bucket", "temp_bin"]
         for c in ["eco_hrpw", "eco_pps", "eco_gct", "eco_vr", "eco_vo", "eco_cad", "eco_stride"]:
@@ -2066,16 +2193,16 @@ def full_pipeline(file_bytes: bytes, file_name: str) -> pd.DataFrame:
                 target.loc[idx, "eco_hrpw"] = -robust_z(g["hr_per_watt"], g["hr_per_watt"])
             if g["power_per_speed"].notna().sum() >= min_n:
                 target.loc[idx, "eco_pps"] = -robust_z(g["power_per_speed"], g["power_per_speed"])
-            if g["gct_num"].notna().sum() >= min_n:
-                target.loc[idx, "eco_gct"] = -robust_z(g["gct_num"], g["gct_num"])
-            if g["vr_num"].notna().sum() >= min_n:
-                target.loc[idx, "eco_vr"] = -robust_z(g["vr_num"], g["vr_num"])
-            if g["vo_num"].notna().sum() >= min_n:
-                target.loc[idx, "eco_vo"] = -robust_z(g["vo_num"], g["vo_num"])
-            if g["cad_num"].notna().sum() >= min_n:
-                target.loc[idx, "eco_cad"] = -np.abs(robust_z(g["cad_num"], g["cad_num"]))
-            if g["stride_num"].notna().sum() >= min_n:
-                target.loc[idx, "eco_stride"] = robust_z(g["stride_num"], g["stride_num"])
+            if g[_eco_gct].notna().sum() >= min_n:
+                target.loc[idx, "eco_gct"] = -robust_z(g[_eco_gct], g[_eco_gct])
+            if g[_eco_vr].notna().sum() >= min_n:
+                target.loc[idx, "eco_vr"] = -robust_z(g[_eco_vr], g[_eco_vr])
+            if g[_eco_vo].notna().sum() >= min_n:
+                target.loc[idx, "eco_vo"] = -robust_z(g[_eco_vo], g[_eco_vo])
+            if g[_eco_cad].notna().sum() >= min_n:
+                target.loc[idx, "eco_cad"] = -np.abs(robust_z(g[_eco_cad], g[_eco_cad]))
+            if g[_eco_stride].notna().sum() >= min_n:
+                target.loc[idx, "eco_stride"] = robust_z(g[_eco_stride], g[_eco_stride])
 
         for _, g in eco.groupby(group_cols, dropna=False):
             if len(g) >= CFG["res_min_group"]:
@@ -3118,6 +3245,77 @@ with tab_last:
             if "Cím" in base.columns and pd.notna(last.get("Cím")):
                 st.caption(f"**Cím:** {last['Cím']}")
             st.caption(f"Baseline futások száma: **{len(baseline_full)}**")
+
+            # ── Terep-profil és slope-korrekció összefoglaló ─────────
+            _up   = float(last.get("up_m_per_km", 0)   or 0)
+            _down = float(last.get("down_m_per_km", 0) or 0)
+            _asc  = float(last.get("asc_m", 0)         or 0)
+            _des  = float(last.get("des_m", 0)          or 0)
+            _dist = float(last.get("dist_km", 0)        or 0)
+
+            if _up > 0 or _down > 0:
+                _sc_info = slope_correction_summary(_up, _down)
+                _is_hilly = _up > 5 or _down > 5
+
+                with st.expander(
+                    f"⛰️ Terep-profil és slope-korrekció "
+                    f"({'rolling' if _up < 15 else 'hilly'} – "
+                    f"↑{_asc:.0f} m / ↓{_des:.0f} m, "
+                    f"{_up:.1f} m/km emelkedés)"
+                ):
+                    _tc1, _tc2, _tc3 = st.columns(3)
+                    _tc1.metric("Össz emelkedés", f"{_asc:.0f} m")
+                    _tc2.metric("Össz süllyedés", f"{_des:.0f} m" if _des > 0 else "—")
+                    _tc3.metric("Nettó szint", f"{_asc - _des:+.0f} m")
+
+                    _tc4, _tc5, _tc6 = st.columns(3)
+                    _tc4.metric("Emelkedés/km", f"{_up:.1f} m/km")
+                    _tc5.metric("Süllyedés/km", f"{_down:.1f} m/km")
+                    _tc6.metric("Távolság", f"{_dist:.2f} km")
+
+                    if _is_hilly:
+                        st.markdown("**Slope-korrekció hatása az indexekre** (kivont terep-hatás):")
+                        _corr_rows = []
+                        _labels = {
+                            "vo_num":      ("Vertical Oscillation", "cm",    "↓ csökken emelkedőn → hamis javulás látszata"),
+                            "gct_num":     ("Ground Contact Time",  "ms",    "↓ csökken emelkedőn → hamis javulás látszata"),
+                            "vr_num":      ("Vertical Ratio",       "%",     "↓ kicsit csökken emelkedőn"),
+                            "stride_num":  ("Lépéshossz",           "m",     "↑ nő emelkedőn → hamis javulás látszata"),
+                            "cad_num":     ("Kadencia",             "spm",   "minimális változás"),
+                            "hr_num":      ("Pulzus",               "bpm",   "↑ nő emelkedőn → hamis fáradtság látszata"),
+                            "pace_sec_km": ("Tempó",                "sec/km","↓ csökken emelkedőn (gyorsabb sec/km)"),
+                        }
+                        for k, (lbl, unit, note) in _labels.items():
+                            corr = _sc_info.get(k, 0)
+                            if abs(corr) > 0.001:
+                                _corr_rows.append({
+                                    "Mutató": lbl,
+                                    "Terep-hatás": f"{corr:+.2f} {unit}",
+                                    "Megjegyzés": note,
+                                    "Irány": "🟢 korrigálva" if abs(corr) > 0.5 else "🟡 kis hatás",
+                                })
+                        if _corr_rows:
+                            st.dataframe(
+                                pd.DataFrame(_corr_rows),
+                                use_container_width=True, hide_index=True,
+                            )
+
+                        # VO külön kiemelés ha komoly emelkedő
+                        if _up > 8:
+                            _vo_corr = _sc_info.get("vo_num", 0)
+                            _hr_corr = _sc_info.get("hr_num", 0)
+                            st.info(
+                                f"ℹ️ **Slope-korrekció összefoglalása** – {_up:.1f} m/km emelkedésnél:\n\n"
+                                f"- **VO** terep-hatása: {_vo_corr:+.2f} cm – "
+                                f"emelkedőn a VO tipikusan csökken, ezért ha az indexed mégis nőtt, "
+                                f"az valódi technikai romlást jelent.\n"
+                                f"- **HR** terep-hatása: {_hr_corr:+.2f} bpm – "
+                                f"a Fatigue_score HR-komponensét ennyivel korrigáljuk lefelé.\n"
+                                f"- **RES+** nem mérvadó ezen a terepen "
+                                f"(sík baseline-hoz hasonlítja a dombos futást)."
+                            )
+                    else:
+                        st.caption("Enyhe terep (< 5 m/km) – slope-korrekció minimális hatású.")
 
             if len(baseline_full) < 8:
                 st.info("Kevés baseline futás a biztos elemzéshez (ajánlott ≥ 8–10).")
