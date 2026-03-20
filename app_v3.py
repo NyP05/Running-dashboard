@@ -528,6 +528,9 @@ require_password()
 # =========================================================
 
 def to_float_series(s: pd.Series) -> pd.Series:
+    # Ha már numerikus dtype (float/int), nincs szükség string konverzióra
+    if pd.api.types.is_numeric_dtype(s):
+        return pd.to_numeric(s, errors="coerce")
     s = s.astype(str).str.strip()
     s = s.replace({"--": np.nan, "": np.nan, "None": np.nan})
     s = s.str.replace(" ", "", regex=False)
