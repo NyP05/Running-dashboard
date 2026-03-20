@@ -3083,50 +3083,56 @@ with tab_overview:
 with tab_last:
     st.subheader("🔎 Utolsó futás elemzése")
 
-    if "Technika_index" not in d.columns:
-        st.info("Nincs Technika_index – az utolsó futás technika elemzéséhez számított index kell.")
+    # Minden futás elérhető a selectorban (nem csak ahol van Technika_index)
+    base_all_runs = d.dropna(subset=["Dátum"]).sort_values("Dátum").copy()
+    base = _safe_dropna(d, ["Dátum", "Technika_index"]).sort_values("Dátum")
+
+    if len(base_all_runs) == 0:
+        st.info("Nincs futás adat.")
     else:
-        base = _safe_dropna(d, ["Dátum", "Technika_index"]).sort_values("Dátum")
-        if len(base) == 0:
-            st.info("Nincs elég adat (Dátum + Technika_index).")
+        options = base_all_runs.tail(60).copy()
+
+        def label_row(r):
+            title = r.get("Cím", "") if "Cím" in options.columns else ""
+            rt = run_type_hu(r.get("Run_type", "")) if "Run_type" in options.columns else ""
+            has_tech = "✓" if pd.notna(r.get("Technika_index")) else "—"
+            return f"{r['Dátum'].strftime('%Y-%m-%d %H:%M')} | {rt} | {title} [{has_tech}]"[:120]
+
+        options["__label"] = options.apply(label_row, axis=1)
+        chosen_label = st.selectbox(
+            "Futás kiválasztása  (✓ = van Technika_index, — = nincs)",
+            options["__label"].tolist(),
+            index=len(options) - 1,
+            key="pick_last",
+        )
+        last = options.loc[options["__label"] == chosen_label].iloc[0]
+
+        last_type = None
+        if run_type_col and run_type_col in base.columns and pd.notna(last.get(run_type_col)):
+            last_type = str(last.get(run_type_col)).strip().lower()
+
+        if baseline_mode == "Auto (Edzés típusa szerint)" and last_type in ("easy", "tempo", "race", "interval"):
+            baseline_full = get_type_baseline(
+                base_df=base, last_date=last["Dátum"], run_type_col=run_type_col,
+                target_type=last_type, weeks=baseline_weeks, min_runs=baseline_min_runs,
+            )
+            st.caption(f"Baseline: **{last_type}** futások (hetek: {baseline_weeks}, min: {baseline_min_runs})")
         else:
-            options = base.tail(60).copy()
+            baseline_full = get_easy_baseline(base_df=base, last_date=last["Dátum"], weeks=baseline_weeks, min_runs=baseline_min_runs)
+            st.caption(f"Baseline: **easy** futások (hetek: {baseline_weeks}, min: {baseline_min_runs})")
 
-            def label_row(r):
-                title = r.get("Cím", "") if "Cím" in options.columns else ""
-                rt = run_type_hu(r.get("Run_type", "")) if "Run_type" in options.columns else ""
-                return f"{r['Dátum'].strftime('%Y-%m-%d %H:%M')} | {rt} | {title}"[:120]
+        # --- Fatmax & Aerobic decoupling
+        st.divider()
+        st.subheader("🔥 Fatmax & Aerobic decoupling (proxy)")
 
-            options["__label"] = options.apply(label_row, axis=1)
-            chosen_label = st.selectbox("Futás kiválasztása", options["__label"].tolist(), index=len(options) - 1, key="pick_last")
-            last = options.loc[options["__label"] == chosen_label].iloc[0]
+        hr_col = find_col(base, "Átlagos pulzusszám", "Átlagos pulzusszám ")
+        pace_col_f = find_col(base, "Átlagos tempó")
+        pwr_col = find_col(base, "Átl. teljesítmény", "Átlagos teljesítmény", "Average Power", "Avg Power")
+        pwr_max_col = find_col(base, "Max. teljesítmény", "Maximum Power", "Max Power")
 
-            last_type = None
-            if run_type_col and run_type_col in base.columns and pd.notna(last.get(run_type_col)):
-                last_type = str(last.get(run_type_col)).strip().lower()
-
-            if baseline_mode == "Auto (Edzés típusa szerint)" and last_type in ("easy", "tempo", "race", "interval"):
-                baseline_full = get_type_baseline(
-                    base_df=base, last_date=last["Dátum"], run_type_col=run_type_col,
-                    target_type=last_type, weeks=baseline_weeks, min_runs=baseline_min_runs,
-                )
-                st.caption(f"Baseline: **{last_type}** futások (hetek: {baseline_weeks}, min: {baseline_min_runs})")
-            else:
-                baseline_full = get_easy_baseline(base_df=base, last_date=last["Dátum"], weeks=baseline_weeks, min_runs=baseline_min_runs)
-                st.caption(f"Baseline: **easy** futások (hetek: {baseline_weeks}, min: {baseline_min_runs})")
-
-            # --- Fatmax & Aerobic decoupling
-            st.divider()
-            st.subheader("🔥 Fatmax & Aerobic decoupling (proxy)")
-
-            hr_col = find_col(base, "Átlagos pulzusszám", "Átlagos pulzusszám ")
-            pace_col_f = find_col(base, "Átlagos tempó")
-            pwr_col = find_col(base, "Átl. teljesítmény", "Átlagos teljesítmény", "Average Power", "Avg Power")
-            pwr_max_col = find_col(base, "Max. teljesítmény", "Maximum Power", "Max Power")
-
-            if hr_col is None or pace_col_f is None:
+        if hr_col is None or pace_col_f is None:
                 st.info("Fatmax-hoz kell: **Átlagos pulzusszám** és **Átlagos tempó** oszlop.")
-            else:
+        else:
                 fat_base = baseline_full.copy() if baseline_full is not None and len(baseline_full) > 0 else base.copy()
                 fatmax = estimate_fatmax_from_runs(fat_base, hrmax, hr_col, pace_col_f, pwr_col, min_points=12)
                 dec = aerobic_decoupling_proxy(last, baseline_full, hr_col, pace_col_f, pwr_col)
@@ -3184,27 +3190,27 @@ with tab_last:
                                 use_container_width=True,
                             )
 
-            # --- RES+
-            st.markdown("### ⚡ RES+ (Running Economy) – utolsó futás")
-            res_available = "RES_plus" in base.columns and base["RES_plus"].notna().any()
-            res_last = float(last.get("RES_plus")) if pd.notna(last.get("RES_plus")) else np.nan
-            res_base_val = (
+        # --- RES+
+        st.markdown("### ⚡ RES+ (Running Economy) – utolsó futás")
+        res_available = "RES_plus" in base.columns and base["RES_plus"].notna().any()
+        res_last = float(last.get("RES_plus")) if pd.notna(last.get("RES_plus")) else np.nan
+        res_base_val = (
                 float(np.nanmedian(baseline_full["RES_plus"]))
                 if ("RES_plus" in baseline_full.columns and baseline_full["RES_plus"].notna().any())
                 else np.nan
-            )
-            res_delta = (res_last - res_base_val) if (pd.notna(res_last) and pd.notna(res_base_val)) else np.nan
-            pavg_last = float(last.get("power_avg_w")) if pd.notna(last.get("power_avg_w")) else np.nan
-            pmax_last = float(last.get("power_max_w")) if pd.notna(last.get("power_max_w")) else np.nan
-            p_ratio = (
+        )
+        res_delta = (res_last - res_base_val) if (pd.notna(res_last) and pd.notna(res_base_val)) else np.nan
+        pavg_last = float(last.get("power_avg_w")) if pd.notna(last.get("power_avg_w")) else np.nan
+        pmax_last = float(last.get("power_max_w")) if pd.notna(last.get("power_max_w")) else np.nan
+        p_ratio = (
                 float(last.get("Power_fatigue_hint"))
                 if pd.notna(last.get("Power_fatigue_hint"))
                 else ((pmax_last / pavg_last) if (pd.notna(pmax_last) and pd.notna(pavg_last) and pavg_last > 0) else np.nan)
-            )
+        )
 
-            if not res_available:
+        if not res_available:
                 st.info("Nincs RES_plus adat (hiányos power vagy kevés futás).")
-            else:
+        else:
                 cR1, cR2, cR3, cR4 = st.columns(4)
                 cR1.metric("RES_plus", f"{res_last:.1f}" if pd.notna(res_last) else "—")
                 cR2.metric("RES_plus baseline", f"{res_base_val:.1f}" if pd.notna(res_base_val) else "—")
@@ -3242,29 +3248,29 @@ with tab_last:
                         use_container_width=True,
                     )
 
-            # --- KPI-k
-            st.divider()
-            c1, c2, c3, c4 = st.columns(4)
-            c1.metric("Technika_index", f"{float(last['Technika_index']):.1f}")
-            fat_val = last.get("Fatigue_score")
-            c2.metric("Fatigue_score", f"{float(fat_val):.1f}" if pd.notna(fat_val) else "—")
-            c3.metric("Edzés típusa", run_type_hu(last.get("Run_type")) if pd.notna(last.get("Run_type")) else "—")
-            pace_v = last.get("Átlagos tempó") if "Átlagos tempó" in base.columns else None
-            dist_v = last.get("Távolság") if "Távolság" in base.columns else None
-            c4.metric("Tempó / Táv", f"{pace_v} / {dist_v} km" if (pd.notna(pace_v) or pd.notna(dist_v)) else "—")
+        # --- KPI-k
+        st.divider()
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Technika_index", f"{float(last['Technika_index']):.1f}")
+        fat_val = last.get("Fatigue_score")
+        c2.metric("Fatigue_score", f"{float(fat_val):.1f}" if pd.notna(fat_val) else "—")
+        c3.metric("Edzés típusa", run_type_hu(last.get("Run_type")) if pd.notna(last.get("Run_type")) else "—")
+        pace_v = last.get("Átlagos tempó") if "Átlagos tempó" in base.columns else None
+        dist_v = last.get("Távolság") if "Távolság" in base.columns else None
+        c4.metric("Tempó / Táv", f"{pace_v} / {dist_v} km" if (pd.notna(pace_v) or pd.notna(dist_v)) else "—")
 
-            if "Cím" in base.columns and pd.notna(last.get("Cím")):
+        if "Cím" in base.columns and pd.notna(last.get("Cím")):
                 st.caption(f"**Cím:** {last['Cím']}")
-            st.caption(f"Baseline futások száma: **{len(baseline_full)}**")
+        st.caption(f"Baseline futások száma: **{len(baseline_full)}**")
 
-            # ── Terep-profil és slope-korrekció összefoglaló ─────────
-            _up   = float(last.get("up_m_per_km", 0)   or 0)
-            _down = float(last.get("down_m_per_km", 0) or 0)
-            _asc  = float(last.get("asc_m", 0)         or 0)
-            _des  = float(last.get("des_m", 0)          or 0)
-            _dist = float(last.get("dist_km", 0)        or 0)
+        # ── Terep-profil és slope-korrekció összefoglaló ─────────
+        _up   = float(last.get("up_m_per_km", 0)   or 0)
+        _down = float(last.get("down_m_per_km", 0) or 0)
+        _asc  = float(last.get("asc_m", 0)         or 0)
+        _des  = float(last.get("des_m", 0)          or 0)
+        _dist = float(last.get("dist_km", 0)        or 0)
 
-            if _up > 0 or _down > 0:
+        if _up > 0 or _down > 0:
                 _sc_info = slope_correction_summary(_up, _down)
                 _is_hilly = _up > 5 or _down > 5
 
@@ -3328,14 +3334,14 @@ with tab_last:
                     else:
                         st.caption("Enyhe terep (< 5 m/km) – slope-korrekció minimális hatású.")
 
-            if len(baseline_full) < 8:
+        if len(baseline_full) < 8:
                 st.info("Kevés baseline futás a biztos elemzéshez (ajánlott ≥ 8–10).")
                 if "Run_type" in base.columns:
                     cnts = base["Run_type"].value_counts(dropna=False).head(10)
                     st.write("DEBUG – Edzés típus megoszlás:")
                     st.dataframe(cnts.rename("db").reset_index().rename(columns={"index": "Run_type"}), hide_index=True)
                     st.write("DEBUG last_type:", last_type, "| baseline_mode:", baseline_mode)
-            else:
+        else:
                 compare_cols = [
                     ("Átl. pedálütem", "Cadence (spm)", "cadence_stability"),
                     ("Átlagos lépéshossz", "Lépéshossz (m)", "higher_better"),
