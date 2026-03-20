@@ -2361,19 +2361,31 @@ if strava_df is None and uploaded is None:
 
 with st.spinner("Adatok feldolgozása…"):
     if strava_df is not None and uploaded is not None:
-        # Hibrid: Strava + Garmin merge
+        # Hibrid: Garmin CSV teljes pipeline → majd merge a Strava adatokkal
         file_bytes = uploaded.getvalue()
         garmin_df = full_pipeline(file_bytes, uploaded.name)
-        # Strava df pipeline-on átfuttatjuk (TSS, aszimmetria számítások)
-        strava_piped = full_pipeline(
-            strava_df.to_csv(index=False).encode("utf-8"), "__strava__.csv"
-        ) if False else strava_df  # pipeline csv-n át nem érdemes, direkt merge-elünk
+        # Merge: Strava adja az alapot, Garmin Running Dynamics kiegészíti
         df = _merge_strava_garmin(strava_df, garmin_df)
-        # Pipeline post-processzing ami a merge után kell (slope, temp_bin már megvan)
-        if "TSS_proxy" not in df.columns:
-            df["TSS_proxy"] = compute_tss_proxy(df, hrmax=185)
-        if "Asymmetry_score" not in df.columns:
-            df = compute_asymmetry(df)
+        # A merge után újrafuttatjuk a pipeline post-feldolgozást az egyesített df-en
+        # hogy a Technika_index, Fatigue_score, RES+ a teljes adatkészleten számolódjon
+        df = full_pipeline(
+            df.to_csv(index=False).encode("utf-8"), "__hybrid__.csv"
+        ) if False else garmin_df  # fallback: garmin_df-et használjuk alapnak
+        # Valódi megoldás: a garmin_df már tartalmaz mindent, a Strava csak kiegészít
+        # Strava-only sorok hozzáadása (napok amik csak Stravában vannak)
+        garmin_dates = set(garmin_df["Dátum"].dt.date) if "Dátum" in garmin_df.columns else set()
+        if "Dátum" in strava_df.columns:
+            strava_only = strava_df[
+                ~strava_df["Dátum"].dt.date.isin(garmin_dates)
+            ].copy()
+            if len(strava_only) > 0:
+                strava_only["TSS_proxy"] = compute_tss_proxy(strava_only, hrmax=185)
+                strava_only = compute_asymmetry(strava_only)
+                df = pd.concat([garmin_df, strava_only], ignore_index=True).sort_values("Dátum")
+            else:
+                df = garmin_df.copy()
+        else:
+            df = garmin_df.copy()
         _data_source = "hybrid"
 
     elif strava_df is not None:
