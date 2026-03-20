@@ -4436,13 +4436,15 @@ with tab_strava_analysis:
 
             _col1, _col2 = st.columns([3, 1])
             with _col1:
+                _hover = {"tempó_label": True, "dist_km": ":.1f", "pace_inv": False}
+                if _has_hr and "hr_num" in _sp.columns:
+                    _hover["hr_num"] = True
                 fig_pace = px.scatter(
                     _sp, x="Dátum", y="pace_inv",
                     size="dist_km", size_max=18,
                     color="hr_num" if _has_hr else None,
                     color_continuous_scale="RdYlGn_r",
-                    hover_data={"tempó_label": True, "dist_km": ":.1f",
-                                "hr_num": _has_hr, "pace_inv": False},
+                    hover_data=_hover,
                     labels={"pace_inv": "Sebesség (km/h)", "dist_km": "Táv (km)", "hr_num": "HR"},
                     title="Sebesség időben  (méretarány = távolság, szín = HR)",
                 )
