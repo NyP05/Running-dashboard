@@ -30,6 +30,10 @@ CFG = {
     "baseline_weeks_default": 12,
     "baseline_min_runs_default": 25,
     "hrmax_default": 190,
+    # ---- Antropometriai alapértékek (sidebar-ban felülírható)
+    "weight_kg_default": 70,
+    "height_cm_default": 175,
+    "age_default": 40,
     "ramp_warn": 8.0,
     "ramp_red": 12.0,
     "daily_coach_tech_bad": -5.0,
@@ -678,6 +682,98 @@ def slope_correction_summary(up_m_per_km: float, down_m_per_km: float) -> dict:
     result["_up_m_per_km"] = up
     result["_down_m_per_km"] = down
     return result
+
+
+# =========================================================
+# ANTROPOMETRIAI SZÁMÍTÁSOK
+# =========================================================
+
+def hrmax_from_age(age: int) -> int:
+    """
+    Kor-alapú HRmax becslés.
+    Tanaka et al. (2001) képlet: 208 - 0.7 × kor
+    (pontosabb mint a klasszikus 220 - kor)
+    """
+    return round(208 - 0.7 * age)
+
+
+def age_adjusted_hr_zones(hrmax: int, age: int) -> dict:
+    """
+    Kor-korrigált HR zóna határok.
+    50+ éveseknél a zónák lejjebb tolódnak (lassabb szívfrekvencia-válasz).
+    """
+    # Alap zóna határok (HRmax %-ban)
+    base_zones = {
+        "Z1": (0.50, 0.60),
+        "Z2": (0.60, 0.70),
+        "Z3": (0.70, 0.80),
+        "Z4": (0.80, 0.90),
+        "Z5": (0.90, 1.00),
+    }
+    # 50+ korrekció: minden zóna 2-3%-kal lejjebb
+    age_shift = max(0.0, (age - 35) * 0.001)
+    zones = {}
+    for z, (lo, hi) in base_zones.items():
+        lo_adj = max(0.45, lo - age_shift)
+        hi_adj = max(lo_adj + 0.08, hi - age_shift)
+        zones[z] = (round(hrmax * lo_adj), round(hrmax * hi_adj))
+    return zones
+
+
+def fatmax_hr_pct_from_age(age: int) -> tuple[float, float]:
+    """
+    Kor-alapú Fatmax HR% becslés (Achten & Jeukendrup 2003 alapján).
+    Idősebb futóknál a Fatmax alacsonyabb HR%-on van.
+    Visszatér: (lo_pct, hi_pct)
+    """
+    if age < 30:
+        return (0.70, 0.80)
+    elif age < 40:
+        return (0.68, 0.77)
+    elif age < 50:
+        return (0.65, 0.75)
+    else:
+        return (0.62, 0.72)
+
+
+def recovery_days_age_factor(age: int) -> float:
+    """
+    Kor-alapú recovery szorzó.
+    Irodalom: 40+ éveseknél ~10-20%-kal hosszabb regeneráció.
+    Visszatér: szorzó (1.0 = nincs korrekció, 1.2 = 20%-kal több nap)
+    """
+    if age < 35:
+        return 1.0
+    elif age < 45:
+        return 1.10
+    elif age < 55:
+        return 1.20
+    else:
+        return 1.30
+
+
+def stride_length_ratio(stride_m: float, height_cm: float) -> float:
+    """
+    Lépéshossz / testmagasság arány.
+    Irodalmi optimum: 0.42–0.48 (Heiderscheit et al. 2011)
+    Visszatér: arány (pl. 0.45)
+    """
+    if height_cm <= 0 or pd.isna(stride_m) or pd.isna(height_cm):
+        return np.nan
+    return stride_m / (height_cm / 100.0)
+
+
+def power_per_kg(power_w: float, weight_kg: float) -> float:
+    """W/kg számítás."""
+    if weight_kg <= 0 or pd.isna(power_w):
+        return np.nan
+    return power_w / weight_kg
+
+
+def bmi(weight_kg: float, height_cm: float) -> float:
+    if height_cm <= 0 or weight_kg <= 0:
+        return np.nan
+    return weight_kg / (height_cm / 100.0) ** 2
 
 
 def _safe_dropna(df: pd.DataFrame, subset: list[str]) -> pd.DataFrame:
@@ -2445,9 +2541,43 @@ if slope_col:
 # SIDEBAR: HRmax + Szűrők + Baseline
 # =========================================================
 st.sidebar.divider()
+st.sidebar.header("👤 Antropometriai adatok")
+st.sidebar.caption("Súly, magasság és kor alapján pontosabb elemzés.")
+
+for key, default in [
+    ("weight_kg", CFG["weight_kg_default"]),
+    ("height_cm", CFG["height_cm_default"]),
+    ("age",       CFG["age_default"]),
+]:
+    if key not in st.session_state:
+        st.session_state[key] = default
+
+weight_kg = st.sidebar.number_input(
+    "Testsúly (kg)", min_value=40, max_value=150,
+    value=int(st.session_state.weight_kg), step=1, key="weight_kg_input",
+)
+height_cm = st.sidebar.number_input(
+    "Magasság (cm)", min_value=140, max_value=220,
+    value=int(st.session_state.height_cm), step=1, key="height_cm_input",
+)
+user_age = st.sidebar.number_input(
+    "Kor (év)", min_value=15, max_value=85,
+    value=int(st.session_state.age), step=1, key="age_input",
+)
+st.session_state.weight_kg = weight_kg
+st.session_state.height_cm = height_cm
+st.session_state.age = user_age
+
+# Kor-alapú HRmax javaslat
+_hrmax_suggested = hrmax_from_age(user_age)
+st.sidebar.caption(
+    f"Javasolt HRmax (Tanaka-képlet, {user_age} év): **{_hrmax_suggested} bpm**"
+)
+
+st.sidebar.divider()
 st.sidebar.header("Intenzitás (HR zónák)")
 if "hrmax" not in st.session_state:
-    st.session_state.hrmax = CFG["hrmax_default"]
+    st.session_state.hrmax = _hrmax_suggested
 
 st.session_state.hrmax = st.sidebar.number_input(
     "HRmax (ütés/perc) – zónákhoz",
@@ -2455,9 +2585,30 @@ st.session_state.hrmax = st.sidebar.number_input(
     max_value=240,
     value=int(st.session_state.hrmax),
     step=1,
-    help="Ha nem tudod pontosan, hagyd 185–195 körül.",
+    help=f"Tanaka-képlet szerint ({user_age} évhez): {_hrmax_suggested} bpm. Felülírható ha ismered a valódi értéked.",
 )
 hrmax = int(st.session_state.hrmax)
+
+# Kor-korrigált HR zónák
+hr_zones = age_adjusted_hr_zones(hrmax, user_age)
+# Kor-alapú Fatmax HR% tartomány
+fatmax_hr_pct_lo, fatmax_hr_pct_hi = fatmax_hr_pct_from_age(user_age)
+# Kor-alapú recovery szorzó
+recovery_age_factor = recovery_days_age_factor(user_age)
+
+# Antropometriai összefoglaló a sidebarban
+_bmi = bmi(weight_kg, height_cm)
+_bmi_cat = (
+    "Sovány"      if _bmi < 18.5 else
+    "Normál"      if _bmi < 25.0 else
+    "Túlsúlyos"   if _bmi < 30.0 else
+    "Elhízott"
+)
+st.sidebar.caption(
+    f"BMI: **{_bmi:.1f}** ({_bmi_cat}) | "
+    f"Fatmax HR: **{round(hrmax * fatmax_hr_pct_lo)}–{round(hrmax * fatmax_hr_pct_hi)} bpm** | "
+    f"Recovery szorzó: **×{recovery_age_factor:.1f}**"
+)
 
 st.sidebar.header("Szűrők")
 min_date = pd.to_datetime(d["Dátum"], errors="coerce").dropna().min()
@@ -2547,6 +2698,12 @@ with tab_overview:
     # =========================================================
     st.subheader("🏃 Easy run target – mai állapot")
 
+    # Kor-alapú Fatmax HR% felülírja a CFG értékeket
+    _orig_lo = CFG["easy_target_hr_pct_lo"]
+    _orig_hi = CFG["easy_target_hr_pct_hi"]
+    CFG["easy_target_hr_pct_lo"] = fatmax_hr_pct_lo
+    CFG["easy_target_hr_pct_hi"] = fatmax_hr_pct_hi
+
     _et = compute_easy_target(
         df=d,
         hrmax=hrmax,
@@ -2558,6 +2715,9 @@ with tab_overview:
         baseline_weeks=baseline_weeks,
         baseline_min_runs=baseline_min_runs,
     )
+
+    CFG["easy_target_hr_pct_lo"] = _orig_lo
+    CFG["easy_target_hr_pct_hi"] = _orig_hi
 
     if _et is None:
         st.info("Easy run target-hez legalább 5 easy futás szükséges HR adattal.")
@@ -2755,11 +2915,17 @@ with tab_overview:
     fat_avg = view[fatigue_col].mean() if (fatigue_col and view[fatigue_col].notna().any()) else np.nan
     most_type = run_type_hu(view[run_type_col].value_counts().index[0]) if (run_type_col and len(view) > 0) else "—"
 
-    c1, c2, c3, c4 = st.columns(4)
+    # W/kg átlag (szűrt nézetben)
+    _pwr_avg = view["power_avg_w"].mean() if "power_avg_w" in view.columns and view["power_avg_w"].notna().any() else np.nan
+    _wkg_avg = power_per_kg(_pwr_avg, weight_kg) if pd.notna(_pwr_avg) else np.nan
+
+    c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("Futások (szűrve)", f"{len(view)}")
     c2.metric("Átlag Technika_index", f"{tech_avg:.1f}" if pd.notna(tech_avg) else "—")
     c3.metric("Átlag Fatigue_score", f"{fat_avg:.1f}" if pd.notna(fat_avg) else "—")
-    c4.metric("Leggyakoribb edzés típus", most_type)
+    c4.metric("Átlag W/kg", f"{_wkg_avg:.2f}" if pd.notna(_wkg_avg) else "—",
+              delta=f"{weight_kg} kg alapon")
+    c5.metric("Leggyakoribb típus", most_type)
 
     st.divider()
 
@@ -2891,7 +3057,15 @@ with tab_overview:
             int_base["hr_num"] / float(hrmax),
             np.nan,
         )
-        int_base["hr_zone"] = int_base["hr_pct"].apply(hr_zone_from_pct)
+        # Kor-korrigált HR zóna hozzárendelés
+        def _hr_zone_age_corrected(hr_val):
+            if pd.isna(hr_val):
+                return np.nan
+            for zn, (zlo, zhi) in hr_zones.items():
+                if zlo <= float(hr_val) <= zhi:
+                    return zn
+            return "Z5" if float(hr_val) > list(hr_zones.values())[-1][1] else "Z1"
+        int_base["hr_zone"] = int_base["hr_num"].apply(_hr_zone_age_corrected)
         int_base["rt"] = int_base[run_type_col].astype(str) if run_type_col else "unknown"
 
         w_idx = int_base.set_index("Dátum")
@@ -3408,6 +3582,77 @@ with tab_last:
                 else:
                     st.info("Nincs elég összehasonlítható metrika.")
 
+        # ── Antropometriai értékelés ─────────────────────────────
+        st.divider()
+        st.markdown("### 👤 Antropometriai értékelés")
+        _anthro_cols = st.columns(3)
+
+        # 1. W/kg
+        _pwr_last = float(last.get("power_avg_w") or np.nan) if "power_avg_w" in last.index else np.nan
+        if pd.notna(_pwr_last) and weight_kg > 0:
+            _wkg = power_per_kg(_pwr_last, weight_kg)
+            _wkg_status = (
+                "🟢 Kiváló" if _wkg >= 4.5 else
+                "🟢 Jó"     if _wkg >= 3.5 else
+                "🟡 Közepes" if _wkg >= 2.8 else
+                "🟠 Fejleszthető"
+            )
+            _anthro_cols[0].metric("Power/testsúly", f"{_wkg:.2f} W/kg", delta=_wkg_status)
+        else:
+            _anthro_cols[0].metric("Power/testsúly", "—", delta="nincs power adat")
+
+        # 2. Lépéshossz / testmagasság arány
+        _stride_last = float(last.get("stride_num") or np.nan) if "stride_num" in last.index else np.nan
+        if pd.notna(_stride_last) and height_cm > 0:
+            _slr = stride_length_ratio(_stride_last, height_cm)
+            _slr_status = (
+                "🟢 Optimális (0.42–0.48)"   if 0.42 <= _slr <= 0.48 else
+                "🟠 Túl rövid (< 0.42)"       if _slr < 0.42 else
+                "🟠 Túl hosszú (> 0.48)"
+            )
+            _anthro_cols[1].metric(
+                "Lépéshossz/magasság",
+                f"{_slr:.3f}",
+                delta=_slr_status,
+            )
+            if not (0.42 <= _slr <= 0.48):
+                st.caption(
+                    f"ℹ️ Irodalmi optimum: lépéshossz = 42–48% a testmagassághoz képest "
+                    f"(te: {_stride_last:.2f} m / {height_cm} cm = {_slr:.3f}). "
+                    + ("Rövidebb lépések, magasabb kadencia javasolt." if _slr < 0.42
+                       else "Rövidítsd a lépést, emeld a kadenciát.")
+                )
+        else:
+            _anthro_cols[1].metric("Lépéshossz/magasság", "—", delta="nincs lépéshossz adat")
+
+        # 3. HR zóna azonosítás (kor-korrigált)
+        _hr_last = float(last.get("hr_num") or np.nan) if "hr_num" in last.index else np.nan
+        if pd.notna(_hr_last):
+            _zone_name = "—"
+            for _zn, (_zlo, _zhi) in hr_zones.items():
+                if _zlo <= _hr_last <= _zhi:
+                    _zone_name = _zn
+                    break
+            _anthro_cols[2].metric(
+                "HR zóna (kor-korrigált)",
+                _zone_name,
+                delta=f"{_hr_last:.0f} bpm",
+            )
+            with st.expander("❤️ Kor-korrigált HR zóna határok"):
+                _zone_df = pd.DataFrame([
+                    {"Zóna": k, "Alsó (bpm)": v[0], "Felső (bpm)": v[1],
+                     "Aktuális futás": "← te" if v[0] <= _hr_last <= v[1] else ""}
+                    for k, v in hr_zones.items()
+                ])
+                st.dataframe(_zone_df, use_container_width=True, hide_index=True)
+                st.caption(
+                    f"Kor-korrekció ({user_age} év): a zóna határok "
+                    f"{'lejjebb tolva' if user_age > 35 else 'nem módosítva'} "
+                    f"a standard értékekhez képest."
+                )
+        else:
+            _anthro_cols[2].metric("HR zóna", "—", delta="nincs HR adat")
+
 
 # =========================================================
 # TAB: WARNING
@@ -3851,14 +4096,24 @@ with tab_recovery:
             c1.metric("Medián recovery", f"{rec['median_recovery']:.0f} nap")
             c2.metric("Elemzett események", f"{rec['n_events']}")
             c3.metric("Jelenlegi Fatigue", f"{rec['current_fat']:.0f}" if rec["current_fat"] else "—")
+
+            # Kor-korrigált recovery becslés
+            _pred_raw = rec["predicted_days"]
+            _pred_age = round(_pred_raw * recovery_age_factor) if _pred_raw is not None else None
             c4.metric(
-                "Becsült recovery",
-                f"{rec['predicted_days']} nap" if rec["predicted_days"] is not None else "—",
-                delta="holnaptól számítva" if rec["predicted_days"] else None,
+                "Becsült recovery (kor-korrigált)",
+                f"{_pred_age} nap" if _pred_age is not None else "—",
+                delta=f"×{recovery_age_factor:.1f} ({user_age} év)" if recovery_age_factor > 1.0 else "holnaptól számítva",
             )
 
-            if rec["predicted_days"] is not None:
-                p = rec["predicted_days"]
+            if _pred_age is not None:
+                p = _pred_age
+                if recovery_age_factor > 1.0:
+                    st.caption(
+                        f"ℹ️ Kor-korrekció ({user_age} év): az alap becslés ({_pred_raw} nap) "
+                        f"×{recovery_age_factor:.1f} szorzóval korrigálva → **{p} nap**. "
+                        f"40+ éveseknél irodalmilag hosszabb a regeneráció."
+                    )
                 if p <= 1:
                     st.success(f"🟢 **Valószínűleg felépültél** – becsült recovery: {p} nap.")
                 elif p <= 3:
