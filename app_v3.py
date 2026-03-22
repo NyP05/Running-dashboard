@@ -776,6 +776,233 @@ def bmi(weight_kg: float, height_cm: float) -> float:
     return weight_kg / (height_cm / 100.0) ** 2
 
 
+# =========================================================
+# VERSENYIDŐ BECSLŐ (Riegel + forma-korrekció)
+# =========================================================
+
+def riegel_predict(known_dist_km: float, known_time_sec: float,
+                   target_dist_km: float, fatigue_factor: float = 1.0) -> float:
+    """
+    Riegel (1977) versenyidő becslő:
+      T2 = T1 × (D2/D1)^1.06
+    fatigue_factor: CTL/ATL alapú forma-korrekció (1.0 = semleges)
+    """
+    if known_dist_km <= 0 or known_time_sec <= 0 or target_dist_km <= 0:
+        return np.nan
+    raw = known_time_sec * (target_dist_km / known_dist_km) ** 1.06
+    return raw * fatigue_factor
+
+
+def vo2max_from_race(dist_km: float, time_sec: float) -> float:
+    """
+    VO2max becslés Daniels-képlettel versenyeredményből.
+    vo2max ≈ (-4.60 + 0.182258×v + 0.000104×v²) / (0.8 + 0.1894393×e^(-0.012778×t) + 0.2989558×e^(-0.1932605×t))
+    ahol v = sebesség m/perc, t = idő percben
+    """
+    if dist_km <= 0 or time_sec <= 0:
+        return np.nan
+    t_min = time_sec / 60.0
+    v = (dist_km * 1000.0) / t_min  # m/perc
+    pct_vo2max = 0.8 + 0.1894393 * np.exp(-0.012778 * t_min) + 0.2989558 * np.exp(-0.1932605 * t_min)
+    vo2 = -4.60 + 0.182258 * v + 0.000104 * v ** 2
+    return vo2 / pct_vo2max
+
+
+_RACE_DISTANCES = {
+    "1 km":          1.0,
+    "1 mérföld":     1.609,
+    "3 km":          3.0,
+    "5 km":          5.0,
+    "10 km":         10.0,
+    "15 km":         15.0,
+    "Félmaraton":    21.0975,
+    "30 km":         30.0,
+    "Maraton":       42.195,
+    "50 km ultra":   50.0,
+    "100 km ultra":  100.0,
+}
+
+_RIEGEL_EXP = {  # pontosabb kitevők táv szerint
+    "1 km":          1.06,
+    "1 mérföld":     1.06,
+    "3 km":          1.06,
+    "5 km":          1.06,
+    "10 km":         1.06,
+    "15 km":         1.07,
+    "Félmaraton":    1.07,
+    "30 km":         1.08,
+    "Maraton":       1.08,
+    "50 km ultra":   1.10,
+    "100 km ultra":  1.13,
+}
+
+
+def race_time_table(known_dist: str, known_time_sec: float,
+                    ctl: float | None, atl: float | None,
+                    fatigue: float | None) -> pd.DataFrame:
+    """
+    Versenyidő becslés táblázat minden standard távra.
+    Forma-korrekció: TSB (CTL-ATL) alapú ±%
+      TSB > 10 → 0.98 (jó forma, kicsit gyorsabb)
+      TSB 0–10 → 1.00 (semleges)
+      TSB -10–0 → 1.01 (kicsit fáradt)
+      TSB < -10 → 1.02 (fáradt)
+      TSB < -25 → 1.04 (túlterhelt)
+    """
+    known_km = _RACE_DISTANCES.get(known_dist, 0)
+    if known_km <= 0 or known_time_sec <= 0:
+        return pd.DataFrame()
+
+    # Forma-korrekció TSB alapján
+    tsb = (float(ctl) - float(atl)) if (ctl and atl) else None
+    if tsb is not None:
+        if tsb > 10:
+            forma = 0.98
+            forma_txt = f"🟢 Jó forma (TSB {tsb:+.0f}) → ~2% gyorsabb"
+        elif tsb >= 0:
+            forma = 1.00
+            forma_txt = f"🟡 Semleges (TSB {tsb:+.0f})"
+        elif tsb >= -10:
+            forma = 1.01
+            forma_txt = f"🟠 Kissé fáradt (TSB {tsb:+.0f}) → ~1% lassabb"
+        elif tsb >= -25:
+            forma = 1.02
+            forma_txt = f"🔴 Fáradt (TSB {tsb:+.0f}) → ~2% lassabb"
+        else:
+            forma = 1.04
+            forma_txt = f"🔴 Túlterhelt (TSB {tsb:+.0f}) → ~4% lassabb"
+    else:
+        forma = 1.0
+        forma_txt = "Semleges (nincs TSB adat)"
+
+    rows = []
+    for dist_name, dist_km in _RACE_DISTANCES.items():
+        exp = _RIEGEL_EXP.get(dist_name, 1.06)
+        # Alap Riegel
+        t_base = known_time_sec * (dist_km / known_km) ** exp
+        # Forma-korrigált
+        t_corr = t_base * forma
+        # sec → H:MM:SS
+        def fmt(s):
+            if pd.isna(s): return "—"
+            s = int(round(s))
+            h, r = divmod(s, 3600)
+            m, sec = divmod(r, 60)
+            return f"{h}:{m:02d}:{sec:02d}" if h else f"{m}:{sec:02d}"
+
+        # Tempó (min/km)
+        pace_base = t_base / dist_km
+        pace_corr = t_corr / dist_km
+
+        rows.append({
+            "Táv":              dist_name,
+            "Km":               dist_km,
+            "Alap becslés":     fmt(t_base),
+            "Forma-korrigált":  fmt(t_corr),
+            "Tempó (min/km)":   sec_to_pace_str(pace_corr),
+            "_t_corr":          t_corr,
+        })
+
+    df_out = pd.DataFrame(rows)
+    # Kiemelés: az ismert táv sora
+    return df_out, forma_txt, tsb
+
+
+# =========================================================
+# HŐMÉRSÉKLET-KORREKCIÓ
+# =========================================================
+
+def heat_pace_correction(temp_c: float, hr_avg: float | None = None,
+                         hrmax: int = 185) -> dict:
+    """
+    Hőmérséklet-alapú tempó- és HR-korrekció.
+
+    Irodalom:
+    - Ely et al. (2007): minden 1°C 10°C felett ~6 sec/km extra
+    - Kenefick & Cheuvront (2012): dehidráció + hő HR-emelő hatása
+    - American College of Sports Medicine: >28°C veszélyes zóna
+
+    Visszatér: korrekciós dict a UI-hoz.
+    """
+    if pd.isna(temp_c):
+        return {"correction_sec": 0, "status": "neutral", "advice": "Nincs hőmérséklet adat."}
+
+    t = float(temp_c)
+    base_temp = 10.0  # referencia hőmérséklet
+
+    # Tempó-korrekció (sec/km)
+    if t <= base_temp:
+        corr_sec = 0.0
+        status = "cold"
+    elif t <= 18:
+        corr_sec = 0.0
+        status = "optimal"
+    elif t <= 23:
+        corr_sec = (t - 18) * 4.0
+        status = "warm"
+    elif t <= 28:
+        corr_sec = 20 + (t - 23) * 6.0
+        status = "hot"
+    elif t <= 33:
+        corr_sec = 50 + (t - 28) * 8.0
+        status = "very_hot"
+    else:
+        corr_sec = 90 + (t - 33) * 10.0
+        status = "dangerous"
+
+    # HR-korrekció (bpm) – emelkedő HR azonos tempónál
+    if t <= 18:
+        hr_corr = 0.0
+    elif t <= 25:
+        hr_corr = (t - 18) * 0.8
+    else:
+        hr_corr = 5.6 + (t - 25) * 1.5
+
+    advice_map = {
+        "cold":      "❄️ Hideg – rövid bemelegítés, kezdj lassabban.",
+        "optimal":   "✅ Optimális hőmérséklet – teljes teljesítmény várható.",
+        "warm":      f"🟡 Meleg – várható plusz: +{corr_sec:.0f} sec/km. Több folyadék.",
+        "hot":       f"🟠 Meleg – várható plusz: +{corr_sec:.0f} sec/km. Lassíts tudatosan.",
+        "very_hot":  f"🔴 Nagy meleg – +{corr_sec:.0f} sec/km. Rövidíts, sok folyadék.",
+        "dangerous": f"🚨 Veszélyes hőség – +{corr_sec:.0f} sec/km. Fontold meg az elhalasztást.",
+    }
+
+    return {
+        "temp_c":       t,
+        "correction_sec": corr_sec,
+        "hr_correction":  hr_corr,
+        "status":        status,
+        "advice":        advice_map[status],
+    }
+
+
+def compute_heat_adjusted_df(df: pd.DataFrame, hr_col: str | None) -> pd.DataFrame:
+    """
+    Minden futáshoz kiszámolja a hőmérséklet-korrigált tempót és HR-t.
+    Hozzáadja: pace_heat_adj_sec, hr_heat_adj, heat_status oszlopokat.
+    """
+    out = df.copy()
+    if "temp_c" not in out.columns or "pace_sec_km" not in out.columns:
+        return out
+
+    corrections = out["temp_c"].apply(lambda t: heat_pace_correction(t))
+    out["heat_corr_sec"]    = corrections.apply(lambda d: d["correction_sec"])
+    out["heat_hr_corr"]     = corrections.apply(lambda d: d["hr_correction"])
+    out["heat_status"]      = corrections.apply(lambda d: d["status"])
+    out["pace_heat_adj_sec"] = np.where(
+        out["pace_sec_km"].notna() & out["heat_corr_sec"].notna(),
+        out["pace_sec_km"] - out["heat_corr_sec"],   # kivonva → "sík-ekvivalens"
+        np.nan,
+    )
+    if hr_col and hr_col in out.columns:
+        out["hr_heat_adj"] = np.where(
+            out[hr_col].notna() & out["heat_hr_corr"].notna(),
+            out[hr_col] - out["heat_hr_corr"],
+            np.nan,
+        )
+    return out
+
+
 def _safe_dropna(df: pd.DataFrame, subset: list[str]) -> pd.DataFrame:
     """
     dropna mint a pandas-é, de csak a ténylegesen létező oszlopokra alkalmazza.
@@ -2682,9 +2909,10 @@ view = d.loc[mask].copy().sort_values("Dátum")
 # =========================================================
 # TABOK
 # =========================================================
-tab_overview, tab_last, tab_warn, tab_ready, tab_pmc, tab_recovery, tab_asym, tab_strava, tab_strava_analysis, tab_data = st.tabs(
+tab_overview, tab_last, tab_warn, tab_ready, tab_pmc, tab_recovery, tab_asym, tab_race, tab_heat, tab_strava, tab_strava_analysis, tab_data = st.tabs(
     ["📌 Áttekintés", "🔎 Utolsó futás", "🚦 Warning", "🏁 Readiness",
      "📈 PMC & Kockázat", "🔄 Recovery", "⚖️ Aszimmetria",
+     "🏆 Versenyidő", "🌡️ Hőkorrekció",
      "🟠 Strava adatok", "🟠 Strava elemzés", "📄 Adatok"]
 )
 
@@ -4374,6 +4602,456 @@ with tab_asym:
                     .sort_values("Dátum", ascending=False)[asym_show_cols],
                 use_container_width=True, hide_index=True,
             )
+
+
+# =========================================================
+# TAB: VERSENYIDŐ BECSLŐ
+# =========================================================
+with tab_race:
+    st.subheader("🏆 Versenyidő becslő")
+    st.caption(
+        "Riegel-formula alapján becsüli a versenyidőket különböző távakon. "
+        "A forma-korrekció a jelenlegi CTL/ATL/TSB értékek alapján személyre szabott."
+    )
+
+    # ── Ismert eredmény megadása ──────────────────────────────
+    st.markdown("### 📥 Ismert versenyeredmény vagy edzéstempó")
+    _rc1, _rc2, _rc3 = st.columns(3)
+
+    # Automatikus feltöltés: legjobb race futás az adatokból
+    _race_runs = d[d[run_type_col] == "race"].dropna(subset=["dist_km", "pace_sec_km"]) \
+        if run_type_col and "dist_km" in d.columns else pd.DataFrame()
+
+    _known_dist_sel = _rc1.selectbox(
+        "Ismert táv",
+        options=list(_RACE_DISTANCES.keys()),
+        index=4,  # 10 km default
+        key="race_pred_dist",
+    )
+
+    # Ha van ilyen távolságú verseny az adatokban, ajánljuk fel
+    _known_km = _RACE_DISTANCES[_known_dist_sel]
+    _auto_time = None
+    if not _race_runs.empty:
+        _close = _race_runs[
+            (_race_runs["dist_km"] >= _known_km * 0.9) &
+            (_race_runs["dist_km"] <= _known_km * 1.1)
+        ].sort_values("Dátum", ascending=False)
+        if len(_close) > 0:
+            _best = _close.iloc[0]
+            _auto_time = int(_best["pace_sec_km"] * _best["dist_km"])
+            _rc1.caption(
+                f"📂 Legutóbbi hasonló futás: "
+                f"{_best['Dátum'].strftime('%Y-%m-%d')} – "
+                f"{sec_to_pace_str(_best['pace_sec_km'])}/km"
+            )
+
+    # Idő bevitel: perc + másodperc
+    _default_min = int(_auto_time // 60) if _auto_time else 45
+    _default_sec = int(_auto_time % 60) if _auto_time else 0
+
+    _inp_min = _rc2.number_input("Idő – perc", min_value=0, max_value=600,
+                                  value=_default_min, step=1, key="race_min")
+    _inp_sec = _rc3.number_input("Idő – másodperc", min_value=0, max_value=59,
+                                  value=_default_sec, step=1, key="race_sec")
+    _known_time_sec = _inp_min * 60 + _inp_sec
+
+    if _known_time_sec <= 0:
+        st.info("Add meg az ismert versenyeredményt (perc + másodperc).")
+    else:
+        # Tempó megjelenítés
+        _known_pace = _known_time_sec / _known_km
+        _rc1.metric("Megadott tempó", f"{sec_to_pace_str(_known_pace)} /km")
+
+        # CTL/ATL lekérés a PMC-ből
+        _ctl_now = _atl_now = _tsb_now = None
+        if "TSS_proxy" in d.columns and d["TSS_proxy"].notna().any():
+            _acwr_tmp = compute_acwr(d, load_col="TSS_proxy")
+            if not _acwr_tmp.empty:
+                _pmc_tmp = compute_ctl_atl_tsb(_acwr_tmp)
+                if not _pmc_tmp.empty:
+                    _last_pmc = _pmc_tmp.iloc[-1]
+                    _ctl_now = float(_last_pmc.get("CTL", np.nan))
+                    _atl_now = float(_last_pmc.get("ATL", np.nan))
+                    _tsb_now = _ctl_now - _atl_now if (_ctl_now and _atl_now) else None
+
+        # Versenyidő táblázat
+        result = race_time_table(
+            _known_dist_sel, _known_time_sec,
+            _ctl_now, _atl_now,
+            float(d[fatigue_col].dropna().iloc[-1]) if (fatigue_col and d[fatigue_col].notna().any()) else None
+        )
+
+        if isinstance(result, tuple):
+            _df_race, _forma_txt, _tsb = result
+        else:
+            st.warning("Nem sikerült a becslés."); st.stop()
+
+        # Forma badge
+        st.markdown(f"**Forma-korrekció:** {_forma_txt}")
+
+        st.divider()
+
+        # ── Fő táblázat ───────────────────────────────────────
+        st.markdown("### 📊 Becsült versenyidők")
+
+        # Kiemelés: a megadott táv és a legfontosabb versenyek
+        _highlight = [_known_dist_sel, "5 km", "10 km", "Félmaraton", "Maraton"]
+        _df_show = _df_race[["Táv", "Alap becslés", "Forma-korrigált", "Tempó (min/km)", "Km"]].copy()
+
+        # Szép megjelenítés – kártyák a fő távolságokra
+        st.markdown("#### 🎯 Fő versenytávok")
+        _main_dists = ["5 km", "10 km", "Félmaraton", "Maraton"]
+        _card_cols = st.columns(4)
+        for i, dist_name in enumerate(_main_dists):
+            _row = _df_race[_df_race["Táv"] == dist_name]
+            if _row.empty:
+                continue
+            _r = _row.iloc[0]
+            _is_known = dist_name == _known_dist_sel
+            with _card_cols[i]:
+                st.markdown(
+                    f"""<div style="background:{'#1a3a2a' if _is_known else 'var(--color-background-secondary)'};
+                    border-radius:12px;padding:14px 12px;text-align:center;
+                    border:{'2px solid #2ecc71' if _is_known else '1px solid var(--color-border-tertiary)'}">
+                    <div style="font-size:0.8rem;color:var(--color-text-secondary)">{dist_name}</div>
+                    <div style="font-size:1.6rem;font-weight:500;color:var(--color-text-primary)">{_r['Forma-korrigált']}</div>
+                    <div style="font-size:0.8rem;color:var(--color-text-secondary)">{_r['Tempó (min/km)']} /km</div>
+                    {'<div style="font-size:0.7rem;color:#2ecc71;margin-top:4px">← kiindulás</div>' if _is_known else ''}
+                    </div>""",
+                    unsafe_allow_html=True,
+                )
+
+        st.markdown("<br>", unsafe_allow_html=True)
+
+        # Teljes táblázat
+        with st.expander("📋 Összes távolság részletesen"):
+            st.dataframe(
+                _df_show.drop(columns=["Km"]),
+                use_container_width=True,
+                hide_index=True,
+            )
+
+        st.divider()
+
+        # ── VO2max becslés ────────────────────────────────────
+        st.markdown("### 🫁 VO2max becslés (Daniels-képlet)")
+        _vo2 = vo2max_from_race(_known_km, _known_time_sec)
+        _vo2_cols = st.columns(4)
+        if pd.notna(_vo2):
+            _vo2_cols[0].metric("Becsült VO2max", f"{_vo2:.1f} ml/kg/min")
+            # Kategóriák kor szerint
+            _vo2_cat = (
+                "Kiváló (top 5%)"     if _vo2 >= 60 else
+                "Jó (top 20%)"        if _vo2 >= 52 else
+                "Átlag felett"        if _vo2 >= 45 else
+                "Átlagos"             if _vo2 >= 38 else
+                "Átlag alatt"
+            )
+            _vo2_cols[1].metric("Kategória", _vo2_cat)
+            _vo2_cols[2].metric("Kor", f"{user_age} év")
+            # Kor-korrigált értékelés (VO2max természetesen csökken ~1%/év 25 után)
+            _vo2_age_adj = _vo2 + max(0, (user_age - 25) * 0.5)
+            _vo2_cols[3].metric("Kor-korrigált VO2max", f"{_vo2_age_adj:.1f}",
+                                delta=f"+{_vo2_age_adj - _vo2:.1f} korrekció")
+
+        # ── Tempó vs táv görbe ────────────────────────────────
+        st.markdown("### 📈 Tempó-táv görbe")
+        _curve_df = _df_race[_df_race["_t_corr"].notna()].copy()
+        _curve_df["pace_pred"] = _curve_df["_t_corr"] / _curve_df["Km"]
+        _curve_df["pace_str"] = _curve_df["pace_pred"].apply(sec_to_pace_str)
+
+        fig_race_curve = px.line(
+            _curve_df, x="Km", y="pace_pred",
+            markers=True,
+            labels={"Km": "Távolság (km)", "pace_pred": "Becsült tempó (sec/km)"},
+            title="Becsült versenytemó különböző távakon",
+            hover_data={"Táv": True, "pace_str": True, "Forma-korrigált": True},
+            color_discrete_sequence=["#2ecc71"],
+        )
+        fig_race_curve.update_yaxes(autorange="reversed",
+                                     ticktext=[sec_to_pace_str(v) for v in
+                                               np.linspace(_curve_df["pace_pred"].min(),
+                                                           _curve_df["pace_pred"].max(), 8)],
+                                     tickvals=list(np.linspace(_curve_df["pace_pred"].min(),
+                                                               _curve_df["pace_pred"].max(), 8)))
+        # Ismert pont kiemelése
+        _known_row = _curve_df[_curve_df["Táv"] == _known_dist_sel]
+        if not _known_row.empty:
+            fig_race_curve.add_scatter(
+                x=_known_row["Km"], y=_known_row["pace_pred"],
+                mode="markers", marker=dict(size=12, color="#e74c3c", symbol="star"),
+                name="Kiindulás",
+            )
+        st.plotly_chart(fig_race_curve, use_container_width=True)
+
+        st.divider()
+
+        # ── Saját versenyeredmények vs becslés ───────────────
+        if not _race_runs.empty and len(_race_runs) >= 2:
+            st.markdown("### 🔍 Saját versenyeredmények vs becslés")
+            _cmp = _race_runs.copy()
+            _cmp["actual_time_sec"] = _cmp["pace_sec_km"] * _cmp["dist_km"]
+            _cmp["predicted_sec"] = _cmp["dist_km"].apply(
+                lambda d_km: _known_time_sec * (d_km / _known_km) ** 1.06
+                if _known_km > 0 else np.nan
+            )
+            _cmp["diff_pct"] = ((_cmp["actual_time_sec"] - _cmp["predicted_sec"])
+                                / _cmp["predicted_sec"] * 100)
+            _cmp["actual_pace"] = _cmp["pace_sec_km"].apply(sec_to_pace_str)
+            _cmp["title_short"] = _cmp["Cím"].str[:30] if "Cím" in _cmp.columns else "—"
+
+            fig_cmp = px.scatter(
+                _cmp.dropna(subset=["diff_pct"]),
+                x="Dátum", y="diff_pct",
+                size="dist_km", size_max=16,
+                hover_data={"title_short": True, "actual_pace": True, "dist_km": ":.1f"},
+                color="diff_pct",
+                color_continuous_scale="RdYlGn_r",
+                title="Tényleges versenyeredmény vs Riegel-becslés (%)",
+                labels={"diff_pct": "Eltérés (% – pozitív = lassabb a becslésnél)"},
+            )
+            fig_cmp.add_hline(y=0, line_dash="dash", line_color="gray")
+            st.plotly_chart(fig_cmp, use_container_width=True)
+            st.caption(
+                "Ha az eltérés szisztematikusan pozitív (lassabb a becslésnél): "
+                "dombos terep, hőség vagy túlzott óvatosság. "
+                "Ha negatív: jó versenyformában voltál."
+            )
+
+        # ── Módszertani megjegyzés ────────────────────────────
+        with st.expander("ℹ️ Módszertan és korlátok"):
+            st.markdown("""
+**Riegel-formula (1977):** `T2 = T1 × (D2/D1)^1.06`
+
+A kitevő (1.06) azt jelenti hogy hosszabb távakon arányosan lassabbak vagyunk.
+Ultramaratonoknál módosított kitevőt (1.08–1.13) használunk.
+
+**Forma-korrekció:** TSB (Training Stress Balance = CTL − ATL) alapján:
+- TSB > +10: jó taper, ~2% gyorsabb
+- TSB 0 – +10: semleges forma
+- TSB -10 – 0: enyhe fáradtság, ~1% lassabb
+- TSB −10 – −25: fáradt, ~2% lassabb
+- TSB < −25: túlterhelt, ~4% lassabb
+
+**VO2max (Daniels):** versenyteljesítményből visszaszámolt aerob kapacitás becslés.
+
+**Korlátok:** a formula sík, jó körülmények közt futott versenyekre kalibrált.
+Dombos pályán, nagy melegben, vagy ha nem versenyedsz optimálisan,
+az eredmény eltérhet.
+""")
+
+
+# =========================================================
+# TAB: HŐMÉRSÉKLET-KORREKCIÓ
+# =========================================================
+with tab_heat:
+    st.subheader("🌡️ Hőmérséklet-korrekció")
+    st.caption(
+        "Megmutatja, hogy meleg napokon mekkora a várható teljesítmény-veszteség, "
+        "és kiszámolja a hőség-korrigált 'sík-ekvivalens' tempódat és HR-edet."
+    )
+
+    _has_temp = "temp_c" in d.columns and d["temp_c"].notna().any()
+
+    if not _has_temp:
+        st.info(
+            "Nincs hőmérséklet adat a feltöltött fájlban. "
+            "Garmin exportban a 'Hőmérséklet' oszlopra van szükség."
+        )
+    else:
+        # Hőkorrigált df számítása
+        d_heat = compute_heat_adjusted_df(d, hr_col)
+
+        # ── Mai / legutóbbi futás hőkorrekciója ───────────────
+        st.markdown("### 🔆 Legutóbbi futás hőkorrekciója")
+        _last_heat = d_heat.dropna(subset=["temp_c"]).sort_values("Dátum").iloc[-1] \
+            if d_heat["temp_c"].notna().any() else None
+
+        if _last_heat is not None:
+            _hc = heat_pace_correction(
+                float(_last_heat["temp_c"]),
+                float(_last_heat.get(hr_col, np.nan)) if hr_col else None,
+                hrmax,
+            )
+            # Státusz banner
+            _status_colors = {
+                "cold": "info", "optimal": "success",
+                "warm": "warning", "hot": "warning",
+                "very_hot": "error", "dangerous": "error",
+            }
+            _sc = _status_colors.get(_hc["status"], "info")
+            if _sc == "success":
+                st.success(_hc["advice"])
+            elif _sc == "warning":
+                st.warning(_hc["advice"])
+            elif _sc == "error":
+                st.error(_hc["advice"])
+            else:
+                st.info(_hc["advice"])
+
+            # KPI kártyák
+            _hc1, _hc2, _hc3, _hc4, _hc5 = st.columns(5)
+            _hc1.metric("Hőmérséklet", f"{_hc['temp_c']:.0f} °C")
+            _hc2.metric("Tempó-korrekció", f"+{_hc['correction_sec']:.0f} sec/km",
+                        delta="szükséges lassítás")
+            _hc3.metric("HR-korrekció", f"+{_hc['hr_correction']:.1f} bpm",
+                        delta="azonos tempónál")
+
+            _pace_raw = float(_last_heat.get("pace_sec_km", np.nan)) \
+                if pd.notna(_last_heat.get("pace_sec_km")) else np.nan
+            _pace_adj = float(_last_heat.get("pace_heat_adj_sec", np.nan)) \
+                if pd.notna(_last_heat.get("pace_heat_adj_sec")) else np.nan
+
+            _hc4.metric(
+                "Tényleges tempó",
+                sec_to_pace_str(_pace_raw) + " /km" if pd.notna(_pace_raw) else "—",
+            )
+            _hc5.metric(
+                "Hőkorrigált tempó",
+                sec_to_pace_str(_pace_adj) + " /km" if pd.notna(_pace_adj) else "—",
+                delta="sík 10°C ekvivalens",
+            )
+
+        st.divider()
+
+        # ── Hőkorrekciós referencia táblázat ─────────────────
+        st.markdown("### 📋 Hőmérséklet-korrekciós referencia")
+        _ref_rows = []
+        for _t in [0, 5, 10, 15, 18, 20, 22, 24, 26, 28, 30, 32, 35]:
+            _hc = heat_pace_correction(float(_t))
+            _ref_rows.append({
+                "Hőmérséklet (°C)": _t,
+                "Tempó-plusz (sec/km)": f"+{_hc['correction_sec']:.0f}" if _hc["correction_sec"] > 0 else "—",
+                "HR-plusz (bpm)":       f"+{_hc['hr_correction']:.1f}" if _hc["hr_correction"] > 0 else "—",
+                "Státusz": {
+                    "cold": "❄️ Hideg", "optimal": "✅ Optimális",
+                    "warm": "🟡 Meleg", "hot": "🟠 Forró",
+                    "very_hot": "🔴 Nagyon meleg", "dangerous": "🚨 Veszélyes",
+                }.get(_hc["status"], "—"),
+            })
+        st.dataframe(pd.DataFrame(_ref_rows), use_container_width=True, hide_index=True)
+
+        st.divider()
+
+        # ── Historikus futások hő-korrigált tempóval ──────────
+        st.markdown("### 📈 Futások hőkorrigált tempóval")
+        st.caption(
+            "A kék pontok a tényleges tempót mutatják, a zöld a hő-hatást kivonva "
+            "(mintha minden futást 10°C-on, síkon futottál volna). "
+            "Így jobban látszik a valódi fejlődés."
+        )
+
+        _heat_plot = d_heat.dropna(subset=["Dátum", "pace_sec_km"]).copy()
+        _heat_plot = _heat_plot[_heat_plot["pace_sec_km"] > 0].copy()
+
+        if len(_heat_plot) >= 3:
+            fig_heat = px.scatter(
+                _heat_plot,
+                x="Dátum", y="pace_sec_km",
+                color_discrete_sequence=["#3498db"],
+                opacity=0.5,
+                labels={"pace_sec_km": "Tempó (sec/km)", "Dátum": ""},
+                title="Tényleges vs hőkorrigált tempó",
+            )
+            fig_heat.update_traces(name="Tényleges tempó", showlegend=True)
+
+            if "pace_heat_adj_sec" in _heat_plot.columns and _heat_plot["pace_heat_adj_sec"].notna().any():
+                _adj_plot = _heat_plot.dropna(subset=["pace_heat_adj_sec"])
+                fig_heat.add_scatter(
+                    x=_adj_plot["Dátum"],
+                    y=_adj_plot["pace_heat_adj_sec"],
+                    mode="markers",
+                    marker=dict(color="#2ecc71", size=6, opacity=0.7),
+                    name="Hőkorrigált (10°C ekvivalens)",
+                )
+                # Rolling átlag a korrigálton
+                if len(_adj_plot) >= 8:
+                    _adj_sort = _adj_plot.sort_values("Dátum").copy()
+                    _adj_sort["roll"] = _adj_sort["pace_heat_adj_sec"].rolling(8, min_periods=4).mean()
+                    fig_heat.add_scatter(
+                        x=_adj_sort["Dátum"],
+                        y=_adj_sort["roll"],
+                        mode="lines",
+                        line=dict(color="#27ae60", width=2),
+                        name="8 futós trend (korrigált)",
+                    )
+
+            fig_heat.update_yaxes(autorange="reversed")
+            st.plotly_chart(fig_heat, use_container_width=True)
+
+        st.divider()
+
+        # ── Hőmérséklet megoszlás ─────────────────────────────
+        st.markdown("### 🌡️ Futások hőmérséklet-megoszlása")
+        _ht_col1, _ht_col2 = st.columns(2)
+
+        with _ht_col1:
+            _temp_hist = d_heat.dropna(subset=["temp_c"]).copy()
+            fig_temp_hist = px.histogram(
+                _temp_hist, x="temp_c", nbins=20,
+                title="Futások hőmérséklet szerinti megoszlása",
+                labels={"temp_c": "Hőmérséklet (°C)", "count": "Futások"},
+                color_discrete_sequence=["#e67e22"],
+            )
+            fig_temp_hist.add_vline(x=18, line_dash="dash", line_color="green",
+                                     annotation_text="Optimális határ (18°C)")
+            fig_temp_hist.add_vline(x=28, line_dash="dash", line_color="red",
+                                     annotation_text="Forró határ (28°C)")
+            st.plotly_chart(fig_temp_hist, use_container_width=True)
+
+        with _ht_col2:
+            # Tempó vs hőmérséklet scatter
+            _tv_plot = d_heat.dropna(subset=["temp_c", "pace_sec_km"]).copy()
+            if len(_tv_plot) >= 5:
+                fig_tv = px.scatter(
+                    _tv_plot, x="temp_c", y="pace_sec_km",
+                    color="heat_status" if "heat_status" in _tv_plot.columns else None,
+                    color_discrete_map={
+                        "cold": "#3498db", "optimal": "#2ecc71",
+                        "warm": "#f39c12", "hot": "#e67e22",
+                        "very_hot": "#e74c3c", "dangerous": "#8e44ad",
+                    },
+                    title="Tempó vs hőmérséklet kapcsolata",
+                    labels={"temp_c": "Hőmérséklet (°C)",
+                            "pace_sec_km": "Tempó (sec/km)",
+                            "heat_status": "Kategória"},
+                    opacity=0.7,
+                )
+                # Trendvonal
+                _xf = _tv_plot["temp_c"].to_numpy(dtype=float)
+                _yf = _tv_plot["pace_sec_km"].to_numpy(dtype=float)
+                _mf = np.isfinite(_xf) & np.isfinite(_yf)
+                if _mf.sum() >= 5:
+                    _cf = np.polyfit(_xf[_mf], _yf[_mf], 1)
+                    _xl = np.linspace(_xf[_mf].min(), _xf[_mf].max(), 60)
+                    fig_tv.add_scatter(
+                        x=_xl, y=np.polyval(_cf, _xl),
+                        mode="lines", name="Trend",
+                        line=dict(color="gray", dash="dash", width=1.5),
+                    )
+                fig_tv.update_yaxes(autorange="reversed")
+                st.plotly_chart(fig_tv, use_container_width=True)
+            else:
+                st.info("Kevés adat a hőmérséklet-tempó elemzéshez.")
+
+        # ── Hőkorrekció hatása statisztika ────────────────────
+        st.divider()
+        st.markdown("### 📊 Hőkorrekció összesítő statisztika")
+        if "heat_corr_sec" in d_heat.columns and d_heat["heat_corr_sec"].notna().any():
+            _heat_stats = d_heat.dropna(subset=["heat_corr_sec"]).copy()
+            _hot_runs = _heat_stats[_heat_stats["temp_c"] > 18]
+            _s1, _s2, _s3, _s4 = st.columns(4)
+            _s1.metric("Forró futások (>18°C)", f"{len(_hot_runs)}")
+            _s2.metric("Átlag hőség-korrekció", f"+{_hot_runs['heat_corr_sec'].mean():.0f} sec/km"
+                        if len(_hot_runs) > 0 else "—")
+            _s3.metric("Max hőség-korrekció",
+                        f"+{_hot_runs['heat_corr_sec'].max():.0f} sec/km"
+                        if len(_hot_runs) > 0 else "—")
+            _most_heat = _heat_stats.nlargest(1, "heat_corr_sec")
+            _s4.metric("Legmelegebb futás",
+                        f"{_most_heat['temp_c'].iloc[0]:.0f}°C"
+                        if len(_most_heat) > 0 else "—")
 
 
 # =========================================================
