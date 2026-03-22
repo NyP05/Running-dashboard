@@ -4709,16 +4709,18 @@ with tab_race:
                 continue
             _r = _row.iloc[0]
             _is_known = dist_name == _known_dist_sel
+            _bg     = "#1a3a2a" if _is_known else "var(--color-background-secondary)"
+            _border = "2px solid #2ecc71" if _is_known else "1px solid var(--color-border-tertiary)"
+            _badge  = '<div style="font-size:0.7rem;color:#2ecc71;margin-top:4px">← kiindulás</div>' if _is_known else ""
             with _card_cols[i]:
                 st.markdown(
-                    f"""<div style="background:{'#1a3a2a' if _is_known else 'var(--color-background-secondary)'};
-                    border-radius:12px;padding:14px 12px;text-align:center;
-                    border:{'2px solid #2ecc71' if _is_known else '1px solid var(--color-border-tertiary)'}">
-                    <div style="font-size:0.8rem;color:var(--color-text-secondary)">{dist_name}</div>
-                    <div style="font-size:1.6rem;font-weight:500;color:var(--color-text-primary)">{_r['Forma-korrigált']}</div>
-                    <div style="font-size:0.8rem;color:var(--color-text-secondary)">{_r['Tempó (min/km)']} /km</div>
-                    {'<div style="font-size:0.7rem;color:#2ecc71;margin-top:4px">← kiindulás</div>' if _is_known else ''}
-                    </div>""",
+                    f'<div style="background:{_bg};border-radius:12px;padding:14px 12px;'
+                    f'text-align:center;border:{_border}">'
+                    f'<div style="font-size:0.8rem;color:var(--color-text-secondary)">{dist_name}</div>'
+                    f'<div style="font-size:1.6rem;font-weight:500;color:var(--color-text-primary)">{_r["Forma-korrigált"]}</div>'
+                    f'<div style="font-size:0.8rem;color:var(--color-text-secondary)">{_r["Tempó (min/km)"]} /km</div>'
+                    f'{_badge}'
+                    f'</div>',
                     unsafe_allow_html=True,
                 )
 
