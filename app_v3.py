@@ -2481,7 +2481,7 @@ def full_pipeline(file_bytes: bytes, file_name: str) -> pd.DataFrame:
         )
         p5, p95 = np.nanpercentile(raw_f, 5), np.nanpercentile(raw_f, 95)
         fat["Fatigue_score"] = (100 * (raw_f - p5) / (p95 - p5 + 1e-9)).clip(0, 100)
-        fat["Fatigue_flag"] = fat["Fatigue_score"] > 65
+        fat["Fatigue_flag"] = (fat["Fatigue_score"] > 65).astype(float)
 
         mech = fat["fatigue_gct"] + fat["fatigue_vr"]
         cardio = fat["fatigue_hr"]
@@ -2495,7 +2495,7 @@ def full_pipeline(file_bytes: bytes, file_name: str) -> pd.DataFrame:
 
         df.loc[fat.index, "Fatigue_score"] = fat["Fatigue_score"].values
         df.loc[fat.index, "Fatigue_flag"] = fat["Fatigue_flag"].values
-        df.loc[fat.index, "Fatigue_type"] = fat["Fatigue_type"].values
+        df.loc[fat.index, "Fatigue_type"] = fat["Fatigue_type"].astype(object).values
 
     # =========================================================
     # RES+ (Running Economy Score)
