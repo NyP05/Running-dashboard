@@ -2202,7 +2202,7 @@ NUM_MAP = {
 
 
 @st.cache_data(show_spinner="Adatok feldolgozása…")
-def full_pipeline(file_bytes: bytes, file_name: str, _v: int = 2) -> pd.DataFrame:
+def full_pipeline(file_bytes: bytes, file_name: str, _v: int = 3) -> pd.DataFrame:
     """
     Teljes adatfeldolgozás egyszerre, cache-elve.
     Csak akkor fut újra, ha a fájl megváltozik.
@@ -2402,9 +2402,9 @@ def full_pipeline(file_bytes: bytes, file_name: str, _v: int = 2) -> pd.DataFram
     # =========================================================
     # FATIGUE_SCORE – vektorizált (iterrows helyett groupby-apply)
     # =========================================================
-    df["Fatigue_score"] = np.nan
-    df["Fatigue_flag"] = np.nan
-    df["Fatigue_type"] = np.nan
+    df["Fatigue_score"] = np.nan                          # float64
+    df["Fatigue_flag"]  = np.nan                          # float64
+    df["Fatigue_type"]  = pd.array([None] * len(df), dtype=object)  # object
 
     fat = df[mask_run & df["Technika_index"].notna()].copy()
 
@@ -2687,13 +2687,13 @@ with st.spinner("Adatok feldolgozása…"):
     if strava_df is not None and uploaded is not None:
         # Hibrid: Garmin CSV teljes pipeline → majd merge a Strava adatokkal
         file_bytes = uploaded.getvalue()
-        garmin_df = full_pipeline(file_bytes, uploaded.name, _v=2)
+        garmin_df = full_pipeline(file_bytes, uploaded.name, _v=3)
         # Merge: Strava adja az alapot, Garmin Running Dynamics kiegészíti
         df = _merge_strava_garmin(strava_df, garmin_df)
         # A merge után újrafuttatjuk a pipeline post-feldolgozást az egyesített df-en
         # hogy a Technika_index, Fatigue_score, RES+ a teljes adatkészleten számolódjon
         df = full_pipeline(
-            df.to_csv(index=False).encode("utf-8"), "__hybrid__.csv", _v=2
+            df.to_csv(index=False).encode("utf-8"), "__hybrid__.csv", _v=3
         ) if False else garmin_df  # fallback: garmin_df-et használjuk alapnak
         # Valódi megoldás: a garmin_df már tartalmaz mindent, a Strava csak kiegészít
         # Strava-only sorok hozzáadása (napok amik csak Stravában vannak)
@@ -2722,7 +2722,7 @@ with st.spinner("Adatok feldolgozása…"):
     else:
         # Csak Garmin CSV
         file_bytes = uploaded.getvalue()
-        df = full_pipeline(file_bytes, uploaded.name, _v=2)
+        df = full_pipeline(file_bytes, uploaded.name, _v=3)
         _data_source = "garmin"
 
 # =========================================================
