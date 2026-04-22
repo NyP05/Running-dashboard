@@ -2742,7 +2742,7 @@ with tab_ai:
                     import anthropic as _anthropic
                     _client = _anthropic.Anthropic(api_key=ai_api_key)
                     _resp = _client.messages.create(
-                        model="claude-sonnet-4-20250514",
+                        model="claude-sonnet-4-5-20251001",
                         max_tokens=1500,
                         system=(
                             "Te egy tapasztalt futóedző és sporttudományos szakértő vagy. "
