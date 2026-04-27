@@ -6322,7 +6322,7 @@ with tab_ai:
                     _client = _anthropic.Anthropic(api_key=ai_api_key)
                     _resp = _client.messages.create(
                         model="claude-sonnet-4-6",
-                        max_tokens=1500,
+                        max_tokens=4096,
                         system=(
                             "Te egy tapasztalt futóedző és sporttudományos szakértő vagy. "
                             "Futásbiomechanikai adatokat, terhelésmenedzsmentet (CTL/ATL/TSB/ACWR) "
@@ -6338,6 +6338,8 @@ with tab_ai:
                     st.markdown("---")
                     st.markdown("### 🤖 AI Edző válasza")
                     st.markdown(ai_response)
+                    if _resp.stop_reason == "max_tokens":
+                        st.warning("⚠️ A válasz még így is csonkult. Próbálj konkrétabb / rövidebb kérdést feltenni.")
 
                     # Mentés session-be
                     st.session_state["last_ai_response"] = ai_response
