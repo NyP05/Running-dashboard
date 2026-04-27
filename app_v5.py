@@ -531,6 +531,29 @@ require_password()
 # SEGÉDFÜGGVÉNYEK
 # =========================================================
 
+def parse_gct_balance_series(s: pd.Series) -> pd.Series:
+    """
+    Garmin 'Átlagos talajérintési időegyensúly' oszlopból a bal (B) lábszázalékot vonja ki.
+    Bemenet pl.: "49.6% B / 50.4% J"  →  49.6
+    Kimenet: float Series (NaN ha hiányzó / --)
+    """
+    import re
+    def _parse(v):
+        if v is None:
+            return np.nan
+        v = str(v).strip()
+        if v in ("--", "", "None", "nan"):
+            return np.nan
+        m = re.search(r"([\d.,]+)\s*%\s*B", v, re.IGNORECASE)
+        if m:
+            try:
+                return float(m.group(1).replace(",", "."))
+            except ValueError:
+                return np.nan
+        return np.nan
+    return s.apply(_parse).astype(float)
+
+
 def to_float_series(s: pd.Series) -> pd.Series:
     # Ha már numerikus dtype (float/int), nincs szükség konverzióra
     if pd.api.types.is_numeric_dtype(s):
@@ -2192,13 +2215,17 @@ def compute_asymmetry(df: pd.DataFrame) -> pd.DataFrame:
             np.nan,
         )
 
-    # GCT
-    lc = next((c for c in df.columns if "bal" in c.lower() and "gct" in c.lower()), None)
-    rc = next((c for c in df.columns if "jobb" in c.lower() and "gct" in c.lower()), None)
-    result["asym_gct_pct"] = (
-        pd.Series(_asym_pct(to_float_series(df[lc]), to_float_series(df[rc])), index=df.index)
-        if lc and rc else np.nan
-    )
+    # GCT egyensúly – "gct_bal_left" a pipeline által parsolt bal lábszázalék
+    if "gct_bal_left" in df.columns and df["gct_bal_left"].notna().any():
+        result["asym_gct_pct"] = (np.abs(df["gct_bal_left"] - 50.0) * 2).clip(0, 20)
+    else:
+        # fallback: ha külön bal/jobb GCT oszlop elérhető (pl. XLSX export)
+        lc = next((c for c in df.columns if "bal" in c.lower() and "gct" in c.lower()), None)
+        rc = next((c for c in df.columns if "jobb" in c.lower() and "gct" in c.lower()), None)
+        result["asym_gct_pct"] = (
+            pd.Series(_asym_pct(to_float_series(df[lc]), to_float_series(df[rc])), index=df.index)
+            if lc and rc else np.nan
+        )
 
     # Lépéshossz
     lc = next((c for c in df.columns if "bal" in c.lower() and ("lépés" in c.lower() or "stride" in c.lower())), None)
@@ -2208,8 +2235,13 @@ def compute_asymmetry(df: pd.DataFrame) -> pd.DataFrame:
         if lc and rc else np.nan
     )
 
-    # Power balance
-    bal_col = next((c for c in df.columns if "egyensúly" in c.lower() or "balance" in c.lower()), None)
+    # Power balance – csak "teljesítmény" vagy "power" tartalmú egyensúly oszlop, nem a GCT
+    bal_col = next(
+        (c for c in df.columns
+         if ("egyensúly" in c.lower() or "balance" in c.lower())
+         and "talajérintési" not in c.lower()),
+        None,
+    )
     result["asym_power_pct"] = (
         np.abs(to_float_series(df[bal_col]) - 50.0) * 2 if bal_col else np.nan
     )
@@ -2477,6 +2509,14 @@ def full_pipeline(file_bytes: bytes, file_name: str, _v: int = 3) -> pd.DataFram
     # --- Numerikus oszlopok
     for src, dst in NUM_MAP.items():
         df[dst] = to_float_series(df[src]) if src in df.columns else np.nan
+
+    # --- GCT egyensúly (bal lábszázalék): "49.6% B / 50.4% J" → 49.6
+    _gct_bal_col = next(
+        (c for c in df.columns if "talajérintési" in c.lower() and "egyensúly" in c.lower()), None
+    )
+    df["gct_bal_left"] = (
+        parse_gct_balance_series(df[_gct_bal_col]) if _gct_bal_col else np.nan
+    )
 
     df["pace_sec_km"] = (
         df["Átlagos tempó"].apply(pace_to_sec_per_km)
@@ -2879,7 +2919,7 @@ def _merge_strava_garmin(strava_df: pd.DataFrame, garmin_df: pd.DataFrame) -> pd
 
     # Garmin Running Dynamics oszlopok amik hiányoznak Stravából
     rd_cols = [c for c in ["vr_num", "gct_num", "vo_num", "stride_num",
-                           "asym_gct_pct", "asym_stride_pct", "asym_power_pct", "Asymmetry_score"]
+                           "gct_bal_left", "asym_gct_pct", "asym_stride_pct", "asym_power_pct", "Asymmetry_score"]
                if c in g.columns]
 
     if rd_cols:
@@ -4765,7 +4805,7 @@ with tab_asym:
 
     asym_available = any(
         c in d.columns and d[c].notna().any()
-        for c in ["asym_gct_pct", "asym_stride_pct", "asym_power_pct", "Asymmetry_score"]
+        for c in ["asym_gct_pct", "asym_stride_pct", "asym_power_pct", "Asymmetry_score", "gct_bal_left"]
     )
 
     if not asym_available:
@@ -4787,11 +4827,16 @@ with tab_asym:
 
         if last_asym is not None:
             asym_val = float(last_asym["Asymmetry_score"])
-            c1, c2, c3, c4 = st.columns(4)
+            c1, c2, c3, c4, c5 = st.columns(5)
             c1.metric("Összesített aszimmetria", f"{asym_val:.1f}%")
             c2.metric("GCT aszimmetria", f"{float(last_asym.get('asym_gct_pct', np.nan)):.1f}%" if pd.notna(last_asym.get("asym_gct_pct")) else "—")
             c3.metric("Lépéshossz aszimmetria", f"{float(last_asym.get('asym_stride_pct', np.nan)):.1f}%" if pd.notna(last_asym.get("asym_stride_pct")) else "—")
             c4.metric("Power balance eltérés", f"{float(last_asym.get('asym_power_pct', np.nan)):.1f}%" if pd.notna(last_asym.get("asym_power_pct")) else "—")
+            _gct_bal = last_asym.get("gct_bal_left") if "gct_bal_left" in last_asym.index else np.nan
+            if pd.notna(_gct_bal):
+                _gct_bal = float(_gct_bal)
+                c5.metric("GCT bal/jobb arány", f"{_gct_bal:.1f}% B / {100-_gct_bal:.1f}% J",
+                          help="Talajérintési időegyensúly: 50% B / 50% J az ideális szimmetria")
 
             if asym_val >= CFG["asym_red_pct"]:
                 st.error(f"🔴 Magas aszimmetria ({asym_val:.1f}%) – sérülésprediktív jel. Javasolt: erősítő edzés + fizioterápiás konzultáció.")
@@ -4803,7 +4848,7 @@ with tab_asym:
         st.divider()
 
         # --- Aszimmetria idősor
-        asym_cols_present = [c for c in ["asym_gct_pct", "asym_stride_pct", "asym_power_pct", "Asymmetry_score"]
+        asym_cols_present = [c for c in ["asym_gct_pct", "asym_stride_pct", "asym_power_pct", "Asymmetry_score", "gct_bal_left"]
                              if c in asym_base.columns and asym_base[c].notna().any()]
 
         if asym_cols_present:
@@ -4812,6 +4857,7 @@ with tab_asym:
                 "asym_stride_pct": "Lépéshossz aszimmetria (%)",
                 "asym_power_pct": "Power balance eltérés (%)",
                 "Asymmetry_score": "Összesített aszimmetria (%)",
+                "gct_bal_left": "GCT bal lábszázalék (50% = szimmetria)",
             }
             sel_asym = st.selectbox(
                 "Melyik aszimmetria mutatót nézzük?",
@@ -4842,10 +4888,20 @@ with tab_asym:
                     tr.showlegend = True
                     fig_asym.add_trace(tr)
 
-            fig_asym.add_hline(y=CFG["asym_warn_pct"], line_dash="dot", line_color="orange",
-                                annotation_text=f"Figyelmeztetés ({CFG['asym_warn_pct']}%)")
-            fig_asym.add_hline(y=CFG["asym_red_pct"], line_dash="dot", line_color="red",
-                                annotation_text=f"Kockázati küszöb ({CFG['asym_red_pct']}%)")
+            if sel_asym == "gct_bal_left":
+                fig_asym.add_hline(y=50.0, line_dash="dash", line_color="green",
+                                    annotation_text="Tökéletes szimmetria (50%)")
+                fig_asym.add_hline(y=51.5, line_dash="dot", line_color="orange",
+                                    annotation_text="Figyelmeztetés (±1.5%)")
+                fig_asym.add_hline(y=48.5, line_dash="dot", line_color="orange")
+                fig_asym.add_hline(y=52.5, line_dash="dot", line_color="red",
+                                    annotation_text="Kockázati küszöb (±2.5%)")
+                fig_asym.add_hline(y=47.5, line_dash="dot", line_color="red")
+            else:
+                fig_asym.add_hline(y=CFG["asym_warn_pct"], line_dash="dot", line_color="orange",
+                                    annotation_text=f"Figyelmeztetés ({CFG['asym_warn_pct']}%)")
+                fig_asym.add_hline(y=CFG["asym_red_pct"], line_dash="dot", line_color="red",
+                                    annotation_text=f"Kockázati küszöb ({CFG['asym_red_pct']}%)")
             st.plotly_chart(fig_asym, use_container_width=True)
 
             # --- Aszimmetria vs Fatigue kapcsolat
