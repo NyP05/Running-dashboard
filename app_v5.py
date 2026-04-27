@@ -6195,7 +6195,7 @@ with tab_ai:
                 "📊 Átfogó elemzés és értékelés",
                 "📅 Holnapi edzésjavaslat",
                 "📈 Fejlődési trend és javaslatok",
-                "🏆 Verseny-felkészülési tanács",
+                "🏃 Utolsó futás részletes elemzése",
                 "❓ Saját kérdés",
             ],
             horizontal=False,
@@ -6238,11 +6238,15 @@ with tab_ai:
                     "Azonosítsd a hosszú távú mintákat: mikor volt a csúcspont, mi okoz ingadozást. "
                     "Adj 3 konkrét, személyre szabott javaslatot a következő 4-6 hétre. Magyarul válaszolj."
                 ),
-                "🏆 Verseny-felkészülési tanács": (
-                    "Az alábbi edzésadatok alapján adj verseny-előkészülési tanácsot! "
-                    "Értékeld a jelenlegi versenyképességet (readiness), a forma alakulását (TSB). "
-                    "Javasold az optimális taper stratégiát (mikor és mennyit csökkents), "
-                    "az ideális verseny-napi tempót és a legfontosabb tudnivalókat. Magyarul válaszolj."
+                "🏃 Utolsó futás részletes elemzése": (
+                    "Az alábbi edzésadatok alapján elemezd részletesen az UTOLSÓ FUTÁST! "
+                    "Értékeld: a tempót és a HR-t (volt-e hatékony az erőkifejtés?), "
+                    "a technikát (Technika_index – javult vagy romlott az előző futásokhoz képest?), "
+                    "a fáradtsági szintet (Fatigue_score – mennyire terhelte meg a szervezetet?), "
+                    "és a futás-gazdaságosságot (RES+ ha elérhető). "
+                    "Hasonlítsd össze az előző 4 futással: mi változott, mi a tendencia? "
+                    "Adj konkrét visszajelzést: mi sikerült jól, min kell dolgozni, és mit javasolsz a következő edzésre. "
+                    "Magyarul válaszolj."
                 ),
             }
 
