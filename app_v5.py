@@ -909,6 +909,243 @@ def race_time_table(known_dist: str, known_time_sec: float,
 
 
 # =========================================================
+# SZÉL MODUL – OpenWeatherMap Historical API
+# =========================================================
+
+_OWM_HISTORY_URL = "https://api.openweathermap.org/data/3.0/onecall/timemachine"
+_OWM_GEO_URL     = "https://api.openweathermap.org/geo/1.0/direct"
+
+# Futó légellenállás-modell (Pugh 1971, Davies 1980, Candau et al. 1998)
+# Tempóveszteség sec/km egységben:
+#   dt = (0.0371 × Vw² + 0.0316 × Vw) × (1/Vr) × 1000
+# ahol Vw = szélsebesség m/s, Vr = futó sebesség m/s
+# Hátszél: kb. 50%-os visszanyerés (aszimmetria miatt)
+
+_WIND_RHO_DEFAULT = 1.225  # kg/m³ (15°C, tengszint)
+
+
+def wind_pace_correction(
+    wind_speed_ms: float,
+    wind_deg: float,
+    runner_speed_ms: float,
+    heading_deg: float | None = None,
+) -> dict:
+    """
+    Szél-alapú tempókorrekció.
+
+    wind_speed_ms:  szélsebesség m/s-ban
+    wind_deg:       szél iránya fokokban (meteorológiai: honnan fúj, 0=É, 90=K)
+    runner_speed_ms: futó átlagsebessége m/s
+    heading_deg:    futó átlagos iránya (ha None → körkörös/változó útnak vesszük)
+
+    Visszatér: dict a korrekciókkal és magyarázattal.
+    """
+    if pd.isna(wind_speed_ms) or wind_speed_ms <= 0:
+        return {
+            "wind_speed_ms": 0, "wind_speed_kmh": 0,
+            "pace_correction_sec": 0, "hr_correction_bpm": 0,
+            "energy_cost_pct": 0, "status": "calm",
+            "description": "Szélcsendes – nincs korrekció.",
+            "headwind_component": 0,
+        }
+
+    Vw = float(wind_speed_ms)
+    Vr = max(float(runner_speed_ms), 1.0)
+
+    # Effektív szemközti szélkomponens
+    if heading_deg is not None and not pd.isna(wind_deg):
+        wind_to = (float(wind_deg) + 180) % 360
+        delta = abs(float(heading_deg) - wind_to) % 360
+        if delta > 180:
+            delta = 360 - delta
+        head_factor = np.cos(np.radians(delta))
+    else:
+        head_factor = 0.30
+
+    Vw_eff = Vw * head_factor
+
+    if Vw_eff >= 0:
+        pace_loss = (0.0371 * Vw_eff**2 + 0.0316 * Vw_eff) / Vr * 1000
+    else:
+        pace_gain = (0.0371 * Vw_eff**2 + 0.0316 * abs(Vw_eff)) / Vr * 1000
+        pace_loss = -pace_gain * 0.50
+
+    hr_corr = max(0.0, Vw_eff * 0.5)
+    energy_pct = abs(pace_loss) / (1000 / Vr) * 100 if Vr > 0 else 0
+
+    kmh = Vw * 3.6
+    if kmh < 5:
+        status = "calm"
+    elif kmh < 15:
+        status = "light"
+    elif kmh < 25:
+        status = "moderate"
+    elif kmh < 35:
+        status = "strong"
+    else:
+        status = "very_strong"
+
+    direction_txt = {
+        "calm":       "Szélcsendes",
+        "light":      f"Gyenge szél ({kmh:.0f} km/h)",
+        "moderate":   f"Közepes szél ({kmh:.0f} km/h)",
+        "strong":     f"Erős szél ({kmh:.0f} km/h)",
+        "very_strong":f"Nagyon erős szél ({kmh:.0f} km/h)",
+    }.get(status, f"{kmh:.0f} km/h")
+
+    if pace_loss > 2:
+        effect_txt = f"+{pace_loss:.0f} sec/km lassítás"
+    elif pace_loss < -2:
+        effect_txt = f"{pace_loss:.0f} sec/km gyorsítás (hátszél)"
+    else:
+        effect_txt = "minimális hatás"
+
+    return {
+        "wind_speed_ms":       Vw,
+        "wind_speed_kmh":      kmh,
+        "wind_deg":            wind_deg,
+        "headwind_component":  Vw_eff,
+        "pace_correction_sec": round(pace_loss, 1),
+        "hr_correction_bpm":   round(hr_corr, 1),
+        "energy_cost_pct":     round(energy_pct, 1),
+        "status":              status,
+        "description":         f"{direction_txt} → {effect_txt}",
+    }
+
+
+@st.cache_data(show_spinner="Időjárás lekérdezése…", ttl=3600)
+def fetch_owm_weather(
+    lat: float, lon: float, unix_ts: int, api_key: str
+) -> dict | None:
+    """
+    OpenWeatherMap One Call API 3.0 – historical időjárás lekérés.
+    Visszaadja a futás időpontjához legközelebb eső óra adatait.
+    Cache: 1 óra (az adatok nem változnak).
+    """
+    url = (
+        f"{_OWM_HISTORY_URL}"
+        f"?lat={lat}&lon={lon}&dt={unix_ts}&appid={api_key}&units=metric"
+    )
+    req = urllib.request.Request(url)
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read())
+        hourly = data.get("data", [data])
+        if not hourly:
+            return None
+        h = hourly[0]
+        return {
+            "temp_c":        h.get("temp"),
+            "feels_like":    h.get("feels_like"),
+            "humidity":      h.get("humidity"),
+            "wind_speed_ms": h.get("wind_speed"),
+            "wind_gust_ms":  h.get("wind_gust"),
+            "wind_deg":      h.get("wind_deg"),
+            "weather_desc":  h.get("weather", [{}])[0].get("description", ""),
+            "clouds":        h.get("clouds"),
+            "unix_ts":       h.get("dt"),
+        }
+    except urllib.error.HTTPError as e:
+        if e.code == 401:
+            st.warning("⚠️ OWM API kulcs érvénytelen – ellenőrizd a Secrets-ben.")
+        elif e.code == 429:
+            st.warning("⚠️ OWM API rate limit – várj egy percet.")
+        else:
+            st.warning(f"⚠️ OWM API hiba {e.code}")
+        return None
+    except Exception as e:
+        st.warning(f"⚠️ Időjárás lekérés sikertelen: {e}")
+        return None
+
+
+@st.cache_data(show_spinner="Helyszín koordináták…", ttl=86400)
+def owm_geocode(city: str, api_key: str) -> tuple[float, float] | None:
+    """Városnév → (lat, lon) az OWM Geocoding API-val."""
+    url = f"{_OWM_GEO_URL}?q={urllib.parse.quote(city)}&limit=1&appid={api_key}"
+    req = urllib.request.Request(url)
+    try:
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            results = json.loads(resp.read())
+        if results:
+            return float(results[0]["lat"]), float(results[0]["lon"])
+    except Exception:
+        pass
+    return None
+
+
+def enrich_df_with_weather(
+    df: pd.DataFrame,
+    api_key: str,
+    lat: float,
+    lon: float,
+    runner_speed_col: str = "speed_mps",
+) -> pd.DataFrame:
+    """
+    DataFrame-re alkalmazza az időjárás-lekérést és szél-korrekciót.
+    Minden futáshoz lekéri az OWM adatokat (cache-elve), majd kiszámolja
+    a szél-korrigált tempót.
+
+    Hozzáadott oszlopok:
+      wind_speed_ms, wind_speed_kmh, wind_deg, wind_pace_corr_sec,
+      wind_hr_corr_bpm, pace_wind_adj_sec, owm_temp_c, owm_weather
+    """
+    out = df.copy()
+    if "Dátum" not in out.columns or api_key is None:
+        return out
+
+    for col in ["wind_speed_ms", "wind_speed_kmh", "wind_deg",
+                "wind_pace_corr_sec", "wind_hr_corr_bpm",
+                "pace_wind_adj_sec", "owm_temp_c", "owm_weather"]:
+        out[col] = np.nan
+
+    processed = set()
+    for idx, row in out.iterrows():
+        dt = row["Dátum"]
+        if pd.isna(dt):
+            continue
+        day_key = dt.date() if hasattr(dt, "date") else dt
+        if day_key in processed:
+            prev = out[out["Dátum"].dt.date == day_key].iloc[0] \
+                if hasattr(dt, "date") else None
+            if prev is not None:
+                for col in ["wind_speed_ms", "wind_speed_kmh", "wind_deg",
+                            "owm_temp_c", "owm_weather"]:
+                    out.at[idx, col] = prev.get(col, np.nan)
+            continue
+
+        unix_ts = int(dt.timestamp())
+        weather = fetch_owm_weather(lat, lon, unix_ts, api_key)
+        if weather is None:
+            processed.add(day_key)
+            continue
+
+        out.at[idx, "wind_speed_ms"]  = weather.get("wind_speed_ms")
+        out.at[idx, "wind_speed_kmh"] = (weather.get("wind_speed_ms") or 0) * 3.6
+        out.at[idx, "wind_deg"]       = weather.get("wind_deg")
+        out.at[idx, "owm_temp_c"]     = weather.get("temp_c")
+        out.at[idx, "owm_weather"]    = weather.get("weather_desc", "")
+
+        Vr = float(row.get(runner_speed_col, 0) or 0)
+        if Vr > 0 and weather.get("wind_speed_ms") is not None:
+            wc = wind_pace_correction(
+                wind_speed_ms=weather["wind_speed_ms"],
+                wind_deg=weather.get("wind_deg", 0),
+                runner_speed_ms=Vr,
+                heading_deg=None,
+            )
+            out.at[idx, "wind_pace_corr_sec"] = wc["pace_correction_sec"]
+            out.at[idx, "wind_hr_corr_bpm"]   = wc["hr_correction_bpm"]
+            if pd.notna(row.get("pace_sec_km")) and row["pace_sec_km"] > 0:
+                out.at[idx, "pace_wind_adj_sec"] = (
+                    row["pace_sec_km"] - wc["pace_correction_sec"]
+                )
+
+        processed.add(day_key)
+
+    return out
+
+
+# =========================================================
 # HŐMÉRSÉKLET-KORREKCIÓ
 # =========================================================
 
@@ -2838,6 +3075,46 @@ st.sidebar.caption(
     f"Recovery szorzó: **×{recovery_age_factor:.1f}**"
 )
 
+# ---- Időjárás / Szél API beállítás
+st.sidebar.divider()
+st.sidebar.header("🌬️ Időjárás (szél-korrekció)")
+
+_owm_key = st.secrets.get("OWM_API_KEY", None)
+_owm_city = st.secrets.get("OWM_CITY", "Szekszard,HU")
+_owm_lat  = st.secrets.get("OWM_LAT", None)
+_owm_lon  = st.secrets.get("OWM_LON", None)
+
+if not _owm_key:
+    st.sidebar.info(
+        "Szél-korrekcióhoz add hozzá a Secrets-hez:\n\n"
+        "```toml\n"
+        "OWM_API_KEY = \"abc123...\"\n"
+        "OWM_CITY    = \"Szekszard,HU\"\n"
+        "```\n"
+        "[OpenWeatherMap API kulcs](https://openweathermap.org/api) – ingyenes tier elég."
+    )
+    _owm_enabled = False
+else:
+    if _owm_lat and _owm_lon:
+        _owm_coords = (float(_owm_lat), float(_owm_lon))
+    else:
+        _owm_coords = owm_geocode(_owm_city, _owm_key)
+        if _owm_coords is None:
+            st.sidebar.warning(f"Nem sikerült geokódolni: {_owm_city}")
+            _owm_coords = (46.35, 18.71)  # Szekszárd fallback
+    st.sidebar.success(
+        f"✅ OWM API aktív – {_owm_city} "
+        f"({_owm_coords[0]:.3f}°N, {_owm_coords[1]:.3f}°E)"
+    )
+    _owm_enabled = True
+
+# Szél-korrekció alkalmazása a teljes df-re (csak ha API kulcs van)
+if _owm_enabled:
+    with st.spinner("Szél-adatok lekérdezése…"):
+        d = enrich_df_with_weather(
+            d, _owm_key, _owm_coords[0], _owm_coords[1]
+        )
+
 st.sidebar.header("Szűrők")
 min_date = pd.to_datetime(d["Dátum"], errors="coerce").dropna().min()
 max_date = pd.to_datetime(d["Dátum"], errors="coerce").dropna().max()
@@ -3748,6 +4025,37 @@ with tab_last:
                             )
                     else:
                         st.caption("Enyhe terep (< 5 m/km) – slope-korrekció minimális hatású.")
+
+        # ── Szél-korrekció az utolsó futásnál ────────────────
+        _wind_ms = float(last.get("wind_speed_ms") or np.nan) \
+            if "wind_speed_ms" in last.index else np.nan
+        if pd.notna(_wind_ms) and _wind_ms > 0:
+            _wc_last = wind_pace_correction(
+                wind_speed_ms=_wind_ms,
+                wind_deg=float(last.get("wind_deg") or 0),
+                runner_speed_ms=float(last.get("speed_mps") or 3.0),
+            )
+            with st.expander(
+                f"🌬️ Szél-korrekció – {_wc_last['wind_speed_kmh']:.0f} km/h "
+                f"({_wc_last['description']})"
+            ):
+                _wcc1, _wcc2, _wcc3, _wcc4 = st.columns(4)
+                _wcc1.metric("Szélsebesség", f"{_wc_last['wind_speed_kmh']:.0f} km/h")
+                _wcc2.metric("Tempó-korrekció", f"{_wc_last['pace_correction_sec']:+.0f} sec/km")
+                _wcc3.metric("HR-korrekció", f"+{_wc_last['hr_correction_bpm']:.1f} bpm")
+                _pace_wadj = float(last.get("pace_wind_adj_sec") or np.nan) \
+                    if "pace_wind_adj_sec" in last.index else np.nan
+                _wcc4.metric(
+                    "Szél-korrigált tempó",
+                    sec_to_pace_str(_pace_wadj) + " /km" if pd.notna(_pace_wadj) else "—",
+                )
+                if _wc_last["pace_correction_sec"] > 5:
+                    st.info(
+                        f"ℹ️ A {_wc_last['wind_speed_kmh']:.0f} km/h-s szél kb. "
+                        f"**+{_wc_last['pace_correction_sec']:.0f} sec/km** hátrányt jelentett. "
+                        f"Szélcsendes körülmények között a tempód kb. "
+                        f"**{sec_to_pace_str(_pace_wadj)}/km** lett volna."
+                    )
 
         if len(baseline_full) < 8:
                 st.info("Kevés baseline futás a biztos elemzéshez (ajánlott ≥ 8–10).")
@@ -4851,9 +5159,132 @@ az eredmény eltérhet.
 with tab_heat:
     st.subheader("🌡️ Hőmérséklet-korrekció")
     st.caption(
-        "Megmutatja, hogy meleg napokon mekkora a várható teljesítmény-veszteség, "
-        "és kiszámolja a hőség-korrigált 'sík-ekvivalens' tempódat és HR-edet."
+        "Meleg és szél együttes hatása a tempóra és HR-re. "
+        "A korrigált értékek megmutatják mi lett volna az eredmény ideális körülmények között."
     )
+
+    # ── Szél elemzés (OWM API) ────────────────────────────────
+    _has_wind = "wind_speed_ms" in d.columns and d["wind_speed_ms"].notna().any()
+
+    if _owm_enabled and _has_wind:
+        st.markdown("### 🌬️ Szél-korrekció (OpenWeatherMap adatok alapján)")
+
+        _last_wind = d.dropna(subset=["wind_speed_ms"]).sort_values("Dátum").iloc[-1] \
+            if _has_wind else None
+
+        if _last_wind is not None:
+            _wc = wind_pace_correction(
+                wind_speed_ms=float(_last_wind.get("wind_speed_ms", 0) or 0),
+                wind_deg=float(_last_wind.get("wind_deg", 0) or 0),
+                runner_speed_ms=float(_last_wind.get("speed_mps", 3.0) or 3.0),
+            )
+
+            _wind_status_map = {
+                "calm":       ("success", "🟢"),
+                "light":      ("success", "🟢"),
+                "moderate":   ("warning", "🟡"),
+                "strong":     ("warning", "🟠"),
+                "very_strong":("error",   "🔴"),
+            }
+            _ws_type, _ws_icon = _wind_status_map.get(_wc["status"], ("info", "ℹ️"))
+            _ws_msg = f"{_ws_icon} **{_wc['description']}**"
+            if _ws_type == "success":   st.success(_ws_msg)
+            elif _ws_type == "warning": st.warning(_ws_msg)
+            elif _ws_type == "error":   st.error(_ws_msg)
+            else:                       st.info(_ws_msg)
+
+            _wk1, _wk2, _wk3, _wk4, _wk5 = st.columns(5)
+            _wk1.metric("Szélsebesség",
+                        f"{_wc['wind_speed_kmh']:.0f} km/h",
+                        delta=f"{_wc['wind_speed_ms']:.1f} m/s")
+            _wk2.metric("Szél iránya",
+                        f"{_last_wind.get('wind_deg', '—'):.0f}°"
+                        if pd.notna(_last_wind.get("wind_deg")) else "—")
+            _wk3.metric("Tempó-korrekció",
+                        f"{_wc['pace_correction_sec']:+.0f} sec/km",
+                        delta="szemközti hatás" if _wc["pace_correction_sec"] > 0 else "hátszél")
+            _wk4.metric("HR-korrekció",
+                        f"+{_wc['hr_correction_bpm']:.1f} bpm",
+                        delta="extra szívmunka")
+
+            _pace_raw  = float(_last_wind.get("pace_sec_km", np.nan) or np.nan)
+            _pace_wadj = float(_last_wind.get("pace_wind_adj_sec", np.nan) or np.nan)
+            _wk5.metric(
+                "Szél-korrigált tempó",
+                sec_to_pace_str(_pace_wadj) + " /km" if pd.notna(_pace_wadj) else "—",
+                delta="szélcsendes ekvivalens",
+            )
+
+        st.divider()
+
+        st.markdown("#### 📈 Futások szél-korrigált tempóval")
+        st.caption(
+            "Kék = tényleges tempó | Lila = szél-korrigált (szélcsendes ekvivalens). "
+            "A különbség megmutatja mennyi volt a szél hátránya/előnye."
+        )
+        _wind_plot = d.dropna(subset=["pace_sec_km"]).copy()
+        _wind_plot = _wind_plot[_wind_plot["pace_sec_km"] > 0]
+
+        if len(_wind_plot) >= 3:
+            fig_wind = px.scatter(
+                _wind_plot, x="Dátum", y="pace_sec_km",
+                color_discrete_sequence=["#3498db"],
+                opacity=0.5,
+                labels={"pace_sec_km": "Tempó (sec/km)"},
+                title="Tényleges vs szél-korrigált tempó",
+            )
+            fig_wind.update_traces(name="Tényleges", showlegend=True)
+
+            if "pace_wind_adj_sec" in _wind_plot.columns and \
+               _wind_plot["pace_wind_adj_sec"].notna().any():
+                _wadj = _wind_plot.dropna(subset=["pace_wind_adj_sec"])
+                fig_wind.add_scatter(
+                    x=_wadj["Dátum"], y=_wadj["pace_wind_adj_sec"],
+                    mode="markers",
+                    marker=dict(color="#9b59b6", size=6, opacity=0.8),
+                    name="Szél-korrigált",
+                )
+                for _, row in _wadj.iterrows():
+                    if pd.notna(row["pace_sec_km"]) and pd.notna(row["pace_wind_adj_sec"]):
+                        diff = abs(row["pace_sec_km"] - row["pace_wind_adj_sec"])
+                        if diff > 3:
+                            fig_wind.add_scatter(
+                                x=[row["Dátum"], row["Dátum"]],
+                                y=[row["pace_sec_km"], row["pace_wind_adj_sec"]],
+                                mode="lines",
+                                line=dict(color="gray", width=0.8, dash="dot"),
+                                showlegend=False,
+                            )
+
+            fig_wind.update_yaxes(autorange="reversed")
+            st.plotly_chart(fig_wind, use_container_width=True)
+
+        if _has_wind:
+            st.markdown("#### 📊 Szél összesítő statisztika")
+            _ws1, _ws2, _ws3, _ws4 = st.columns(4)
+            _wind_data = d.dropna(subset=["wind_speed_ms"])
+            _windy = _wind_data[_wind_data["wind_speed_kmh"] > 15] \
+                if "wind_speed_kmh" in _wind_data.columns else pd.DataFrame()
+            _ws1.metric("Szeles futások (>15 km/h)",   f"{len(_windy)}")
+            _ws2.metric("Átlag szélsebesség",
+                        f"{_wind_data['wind_speed_kmh'].mean():.0f} km/h"
+                        if "wind_speed_kmh" in _wind_data.columns else "—")
+            _ws3.metric("Max szélsebesség",
+                        f"{_wind_data['wind_speed_kmh'].max():.0f} km/h"
+                        if "wind_speed_kmh" in _wind_data.columns else "—")
+            _avg_corr = d["wind_pace_corr_sec"].mean() \
+                if "wind_pace_corr_sec" in d.columns and d["wind_pace_corr_sec"].notna().any() \
+                else np.nan
+            _ws4.metric("Átlag szél-veszteség",
+                        f"+{_avg_corr:.0f} sec/km" if pd.notna(_avg_corr) else "—")
+
+        st.divider()
+
+    elif not _owm_enabled:
+        st.info(
+            "🌬️ **Szél-korrekció** – Add meg az OWM API kulcsot a bal oldali sávban "
+            "a Secrets beállításoknál az automatikus szél-elemzés aktiválásához."
+        )
 
     _has_temp = "temp_c" in d.columns and d["temp_c"].notna().any()
 
