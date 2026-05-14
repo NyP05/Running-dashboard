@@ -31,9 +31,9 @@ CFG = {
     "baseline_min_runs_default": 25,
     "hrmax_default": 190,
     # ---- Antropometriai alapértékek (sidebar-ban felülírható)
-    "weight_kg_default": 70,
-    "height_cm_default": 175,
-    "age_default": 40,
+    "weight_kg_default": 101,
+    "height_cm_default": 184,
+    "age_default": 41,
     "ramp_warn": 8.0,
     "ramp_red": 12.0,
     "daily_coach_tech_bad": -5.0,
