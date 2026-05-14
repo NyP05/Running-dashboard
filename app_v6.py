@@ -706,14 +706,11 @@ def fetch_owm_weather(
         }
     except urllib.error.HTTPError as e:
         if e.code == 401:
-            st.warning("⚠️ OWM API kulcs érvénytelen – ellenőrizd a Secrets-ben.")
-        elif e.code == 429:
-            st.warning("⚠️ OWM API rate limit – várj egy percet.")
-        else:
-            st.warning(f"⚠️ OWM API hiba {e.code}")
-        return None
-    except Exception as e:
-        st.warning(f"⚠️ Időjárás lekérés sikertelen: {e}")
+            return {"_error": "auth"}
+        if e.code == 429:
+            return {"_error": "ratelimit"}
+        return {"_error": f"http_{e.code}"}
+    except Exception:
         return None
 
 
@@ -774,6 +771,17 @@ def enrich_df_with_weather(
 
         unix_ts = int(dt.timestamp())
         weather = fetch_owm_weather(lat, lon, unix_ts, api_key)
+        if isinstance(weather, dict) and "_error" in weather:
+            err = weather["_error"]
+            if err == "auth":
+                st.warning(
+                    "⚠️ OWM API kulcs érvénytelen vagy nem jogosult a One Call 3.0 API-ra. "
+                    "Ellenőrizd a Secrets-ben, és győződj meg róla, hogy feliratkoztál a "
+                    "**One Call by Call** csomagra: openweathermap.org/api/one-call-3"
+                )
+            elif err == "ratelimit":
+                st.warning("⚠️ OWM API rate limit – várj egy percet.")
+            break  # ne próbálja a többi futásnál is
         if weather is None:
             processed.add(day_key)
             continue
@@ -2656,15 +2664,23 @@ if not _owm_key:
 else:
     if _owm_lat and _owm_lon:
         _owm_coords = (float(_owm_lat), float(_owm_lon))
+        st.sidebar.success(
+            f"✅ OWM API aktív – {_owm_city} "
+            f"({_owm_coords[0]:.3f}°N, {_owm_coords[1]:.3f}°E)"
+        )
     else:
         _owm_coords = owm_geocode(_owm_city, _owm_key)
         if _owm_coords is None:
-            st.sidebar.warning(f"Nem sikerült geokódolni: {_owm_city}")
             _owm_coords = (46.35, 18.71)  # Szekszárd fallback
-    st.sidebar.success(
-        f"✅ OWM API aktív – {_owm_city} "
-        f"({_owm_coords[0]:.3f}°N, {_owm_coords[1]:.3f}°E)"
-    )
+            st.sidebar.info(
+                f"ℹ️ OWM aktív – fallback koordináta használatban "
+                f"({_owm_coords[0]:.3f}°N, {_owm_coords[1]:.3f}°E)"
+            )
+        else:
+            st.sidebar.success(
+                f"✅ OWM API aktív – {_owm_city} "
+                f"({_owm_coords[0]:.3f}°N, {_owm_coords[1]:.3f}°E)"
+            )
     _owm_enabled = True
 
 # Szél-korrekció alkalmazása a teljes df-re (csak ha API kulcs van)
