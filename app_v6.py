@@ -335,11 +335,7 @@ def hrmax_from_age(age: int) -> int:
 
 
 def age_adjusted_hr_zones(hrmax: int, age: int) -> dict:
-    """
-    Kor-korrigált HR zóna határok.
-    50+ éveseknél a zónák lejjebb tolódnak (lassabb szívfrekvencia-válasz).
-    """
-    # Alap zóna határok (HRmax %-ban)
+    """Kor-korrigált HR zóna határok (HRmax-alapú, fallback)."""
     base_zones = {
         "Z1": (0.50, 0.60),
         "Z2": (0.60, 0.70),
@@ -347,7 +343,6 @@ def age_adjusted_hr_zones(hrmax: int, age: int) -> dict:
         "Z4": (0.80, 0.90),
         "Z5": (0.90, 1.00),
     }
-    # 50+ korrekció: minden zóna 2-3%-kal lejjebb
     age_shift = max(0.0, (age - 35) * 0.001)
     zones = {}
     for z, (lo, hi) in base_zones.items():
@@ -355,6 +350,33 @@ def age_adjusted_hr_zones(hrmax: int, age: int) -> dict:
         hi_adj = max(lo_adj + 0.08, hi - age_shift)
         zones[z] = (round(hrmax * lo_adj), round(hrmax * hi_adj))
     return zones
+
+
+# LT2-alapú zóna nevek (Garmin-kompatibilis)
+LT2_ZONE_NAMES = {
+    "Z1": "Z1 Bemelegítés",
+    "Z2": "Z2 Könnyű",
+    "Z3": "Z3 Aerobik",
+    "Z4": "Z4 Küszöb",
+    "Z5": "Z5 Maximális",
+}
+
+# LT2% határok: (lo_pct, hi_pct)
+_LT2_PCT = {
+    "Z1": (0.65, 0.81),
+    "Z2": (0.82, 0.89),
+    "Z3": (0.90, 0.93),
+    "Z4": (0.94, 0.99),
+    "Z5": (1.00, 1.13),
+}
+
+
+def lt2_hr_zones(lt2: int) -> dict:
+    """
+    Tejsavküszöb (LT2) alapú HR zónák bpm-ben.
+    Visszatérési forma: {"Z1": (lo, hi), ..., "Z5": (lo, hi)}
+    """
+    return {z: (round(lt2 * lo), round(lt2 * hi)) for z, (lo, hi) in _LT2_PCT.items()}
 
 
 def fatmax_hr_pct_from_age(age: int) -> tuple[float, float]:
@@ -2565,7 +2587,7 @@ if "hrmax" not in st.session_state:
     st.session_state.hrmax = _hrmax_suggested
 
 st.session_state.hrmax = st.sidebar.number_input(
-    "HRmax (ütés/perc) – zónákhoz",
+    "HRmax (ütés/perc) – TSS számításhoz",
     min_value=120,
     max_value=240,
     value=int(st.session_state.hrmax),
@@ -2574,8 +2596,25 @@ st.session_state.hrmax = st.sidebar.number_input(
 )
 hrmax = int(st.session_state.hrmax)
 
-# Kor-korrigált HR zónák
-hr_zones = age_adjusted_hr_zones(hrmax, user_age)
+# LT2 (tejsavküszöb) alapú zónák
+if "lt2_bpm" not in st.session_state:
+    st.session_state.lt2_bpm = 157
+st.session_state.lt2_bpm = st.sidebar.number_input(
+    "LT2 – tejsavküszöb (bpm)",
+    min_value=100,
+    max_value=220,
+    value=int(st.session_state.lt2_bpm),
+    step=1,
+    help=(
+        "Tejsavküszöb (LT2) pulzus. "
+        "Zónák: Z1 65–81%, Z2 82–89%, Z3 90–93%, Z4 94–99%, Z5 100–113% az LT2-hez képest."
+    ),
+)
+lt2_bpm = int(st.session_state.lt2_bpm)
+
+# HR zónák: LT2-alapú
+hr_zones = lt2_hr_zones(lt2_bpm)
+hr_zone_labels = LT2_ZONE_NAMES
 # Kor-alapú Fatmax HR% tartomány
 fatmax_hr_pct_lo, fatmax_hr_pct_hi = fatmax_hr_pct_from_age(user_age)
 # Kor-alapú recovery szorzó
@@ -3083,15 +3122,15 @@ with tab_overview:
             int_base["hr_num"] / float(hrmax),
             np.nan,
         )
-        # Kor-korrigált HR zóna hozzárendelés
-        def _hr_zone_age_corrected(hr_val):
+        # LT2-alapú HR zóna hozzárendelés
+        def _hr_zone_lt2(hr_val):
             if pd.isna(hr_val):
                 return np.nan
             for zn, (zlo, zhi) in hr_zones.items():
                 if zlo <= float(hr_val) <= zhi:
                     return zn
             return "Z5" if float(hr_val) > list(hr_zones.values())[-1][1] else "Z1"
-        int_base["hr_zone"] = int_base["hr_num"].apply(_hr_zone_age_corrected)
+        int_base["hr_zone"] = int_base["hr_num"].apply(_hr_zone_lt2)
         int_base["rt"] = int_base[run_type_col].astype(str) if run_type_col else "unknown"
 
         w_idx = int_base.set_index("Dátum")
@@ -3132,33 +3171,37 @@ with tab_overview:
                 st.info("Edzés típus hiányzik / nincs felismerve.")
 
         with cR:
-            st.markdown("#### ❤️ HR zóna megoszlás (heti %)")
+            st.markdown(f"#### ❤️ HR zóna megoszlás (heti %, LT2={lt2_bpm} bpm)")
             if int_base["hr_zone"].notna().sum() >= 5 and hz_cols:
                 hz_long = hz_pivot[["week"] + hz_cols].melt("week", var_name="Zone", value_name="Percent")
+                hz_long["Zone"] = hz_long["Zone"].map(hr_zone_labels).fillna(hz_long["Zone"])
                 st.plotly_chart(
-                    px.bar(hz_long, x="week", y="Percent", color="Zone", barmode="stack", labels={"week": "Hét", "Percent": "%"}),
+                    px.bar(hz_long, x="week", y="Percent", color="Zone", barmode="stack",
+                           labels={"week": "Hét", "Percent": "%"},
+                           category_orders={"Zone": list(hr_zone_labels.values())}),
                     use_container_width=True,
                 )
             else:
                 st.info("Kevés / hiányzó pulzus adat.")
 
         st.divider()
-        st.markdown("#### 🔎 Terhelés vs Intenzitás (heti km + Z4/Z5 arány)")
+        st.markdown("#### 🔎 Terhelés vs Intenzitás (heti km + Z4 Küszöb / Z5 Max arány)")
         if hz_cols:
             hz_pivot["hi_intensity_pct"] = hz_pivot.get("Z4", 0) + hz_pivot.get("Z5", 0)
             combo = weekly_km.rename(columns={"Dátum": "week"}).merge(hz_pivot[["week", "hi_intensity_pct"]], on="week", how="left")
             combo["hi_intensity_pct"] = combo["hi_intensity_pct"].fillna(0.0)
             st.plotly_chart(
-                px.scatter(combo, x="week_km", y="hi_intensity_pct", hover_data=["week"], labels={"week_km": "Heti km", "hi_intensity_pct": "Z4+Z5 %"}),
+                px.scatter(combo, x="week_km", y="hi_intensity_pct", hover_data=["week"],
+                           labels={"week_km": "Heti km", "hi_intensity_pct": "Z4 Küszöb + Z5 Max %"}),
                 use_container_width=True,
             )
             if len(combo.dropna(subset=["week_km"])) >= 4:
                 last = combo.iloc[-1]
-                msg_txt = f"Utolsó hét: **{last['week_km']:.1f} km**, magas intenzitás (Z4+Z5): **{last['hi_intensity_pct']:.0f}%**."
+                msg_txt = f"Utolsó hét: **{last['week_km']:.1f} km**, küszöb+max intenzitás (Z4+Z5): **{last['hi_intensity_pct']:.0f}%**."
                 if last["hi_intensity_pct"] >= 30:
-                    st.warning(f"🟠 Sok a magas intenzitás (Z4+Z5) → ez felnyomhatja a Fatigue_score-t.\n\n{msg_txt}")
+                    st.warning(f"🟠 Sok a küszöb/maximális intenzitás (Z4+Z5) → ez felnyomhatja a Fatigue_score-t.\n\n{msg_txt}")
                 else:
-                    st.success(f"🟢 A magas intenzitás arány nem extrém.\n\n{msg_txt}")
+                    st.success(f"🟢 A küszöb/max intenzitás arány rendben.\n\n{msg_txt}")
 
     # --- Technika idősor
     st.divider()
@@ -3682,31 +3725,33 @@ with tab_last:
         else:
             _anthro_cols[1].metric("Lépéshossz/magasság", "—", delta="nincs lépéshossz adat")
 
-        # 3. HR zóna azonosítás (kor-korrigált)
+        # 3. HR zóna azonosítás (LT2-alapú)
         _hr_last = float(last.get("hr_num") or np.nan) if "hr_num" in last.index else np.nan
         if pd.notna(_hr_last):
-            _zone_name = "—"
+            _zone_key = "—"
             for _zn, (_zlo, _zhi) in hr_zones.items():
                 if _zlo <= _hr_last <= _zhi:
-                    _zone_name = _zn
+                    _zone_key = _zn
                     break
+            _zone_label = hr_zone_labels.get(_zone_key, _zone_key)
             _anthro_cols[2].metric(
-                "HR zóna (kor-korrigált)",
-                _zone_name,
+                "HR zóna (LT2-alapú)",
+                _zone_label,
                 delta=f"{_hr_last:.0f} bpm",
             )
-            with st.expander("❤️ Kor-korrigált HR zóna határok"):
+            with st.expander(f"❤️ LT2-alapú HR zóna határok (LT2 = {lt2_bpm} bpm)"):
                 _zone_df = pd.DataFrame([
-                    {"Zóna": k, "Alsó (bpm)": v[0], "Felső (bpm)": v[1],
-                     "Aktuális futás": "← te" if v[0] <= _hr_last <= v[1] else ""}
+                    {
+                        "Zóna": hr_zone_labels.get(k, k),
+                        "LT2%": f"{round(_LT2_PCT[k][0]*100)}–{round(_LT2_PCT[k][1]*100)}%",
+                        "Alsó (bpm)": v[0],
+                        "Felső (bpm)": v[1],
+                        "Aktuális futás": "← te" if v[0] <= _hr_last <= v[1] else "",
+                    }
                     for k, v in hr_zones.items()
                 ])
                 st.dataframe(_zone_df, use_container_width=True, hide_index=True)
-                st.caption(
-                    f"Kor-korrekció ({user_age} év): a zóna határok "
-                    f"{'lejjebb tolva' if user_age > 35 else 'nem módosítva'} "
-                    f"a standard értékekhez képest."
-                )
+                st.caption(f"LT2 = {lt2_bpm} bpm alapján számolt egyéni zónák.")
         else:
             _anthro_cols[2].metric("HR zóna", "—", delta="nincs HR adat")
 
