@@ -72,392 +72,6 @@ CFG = {
     "easy_target_band_pwr": 10,      # ±W a célsáv szélessége
 }
 
-# =========================================================
-# STRAVA INTEGRÁCIÓ
-# =========================================================
-
-# --- Strava OAuth2 konstansok
-_STRAVA_AUTH_URL = "https://www.strava.com/oauth/authorize"
-_STRAVA_TOKEN_URL = "https://www.strava.com/oauth/token"
-_STRAVA_API_BASE = "https://www.strava.com/api/v3"
-
-# Strava aktivitástípus → Run_type mapping
-_STRAVA_TYPE_MAP = {
-    "Run": "easy",        # fallback – pace alapján pontosítjuk
-    "TrailRun": "easy",
-    "VirtualRun": "easy",
-    "Race": "race",
-    "Workout": "tempo",
-}
-
-# Strava mezők → pipeline oszlopok megfeleltetése
-# (azokat az oszlopokat képezzük le, amit a pipeline és az elemzők elvárnak)
-_STRAVA_FIELD_MAP = {
-    "Cím":                    "name",
-    "Tevékenység típusa":     "_type",          # belső, konvertáljuk
-    "Távolság":               "_dist_m",         # méterben jön, km-re váltjuk
-    "Idő":                    "_dur_sec_raw",
-    "Átlagos tempó":          "_pace_raw",        # sec/m → min/km
-    "Átlagos pulzusszám":     "average_heartrate",
-    "Max pulzus":             "max_heartrate",
-    "Teljes emelkedés":       "total_elevation_gain",
-    "Átl. pedálütem":         "average_cadence",  # Strava 2×-es → osztjuk
-    "Átl. teljesítmény":      "average_watts",
-    "Max. teljesítmény":      "max_watts",
-    "Hőmérséklet":            "average_temp",
-    "Dátum":                  "start_date_local",
-}
-
-
-def _strava_secrets() -> tuple[str | None, str | None, str | None]:
-    """Visszaadja a (client_id, client_secret, refresh_token) hármast a Secrets-ből."""
-    cid   = st.secrets.get("STRAVA_CLIENT_ID", None)
-    csec  = st.secrets.get("STRAVA_CLIENT_SECRET", None)
-    rtok  = st.secrets.get("STRAVA_REFRESH_TOKEN", None)
-    return cid, csec, rtok
-
-
-def strava_auth_url(client_id: str, redirect_uri: str) -> str:
-    """Generálja az OAuth2 authorization URL-t (csak a helper scripthez kell)."""
-    params = {
-        "client_id": client_id,
-        "redirect_uri": redirect_uri,
-        "response_type": "code",
-        "approval_prompt": "auto",
-        "scope": "read,activity:read_all",
-    }
-    return f"{_STRAVA_AUTH_URL}?{urllib.parse.urlencode(params)}"
-
-
-def strava_exchange_code(client_id: str, client_secret: str, code: str) -> dict | None:
-    """Authorization code → access + refresh token csere (helper scripthez)."""
-    payload = urllib.parse.urlencode({
-        "client_id": client_id,
-        "client_secret": client_secret,
-        "code": code,
-        "grant_type": "authorization_code",
-    }).encode()
-    req = urllib.request.Request(_STRAVA_TOKEN_URL, data=payload, method="POST")
-    req.add_header("Content-Type", "application/x-www-form-urlencoded")
-    try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            return json.loads(resp.read())
-    except Exception as e:
-        st.error(f"Strava token csere sikertelen: {e}")
-        return None
-
-
-def strava_refresh_token(client_id: str, client_secret: str, refresh_token: str) -> dict | None:
-    """Lejárt access token megújítása refresh token-nel."""
-    payload = urllib.parse.urlencode({
-        "client_id": client_id,
-        "client_secret": client_secret,
-        "refresh_token": refresh_token,
-        "grant_type": "refresh_token",
-    }).encode()
-    req = urllib.request.Request(_STRAVA_TOKEN_URL, data=payload, method="POST")
-    req.add_header("Content-Type", "application/x-www-form-urlencoded")
-    try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            return json.loads(resp.read())
-    except Exception as e:
-        st.error(f"Strava token megújítás sikertelen: {e}")
-        return None
-
-
-def _strava_get(endpoint: str, access_token: str, params: dict | None = None) -> list | dict | None:
-    """Egyszerű Strava API GET hívás. Rate-limit kezeléssel."""
-    url = f"{_STRAVA_API_BASE}{endpoint}"
-    if params:
-        url += "?" + urllib.parse.urlencode(params)
-    req = urllib.request.Request(url)
-    req.add_header("Authorization", f"Bearer {access_token}")
-    try:
-        with urllib.request.urlopen(req, timeout=20) as resp:
-            return json.loads(resp.read())
-    except urllib.error.HTTPError as e:
-        if e.code == 429:
-            st.warning("Strava API rate limit elérve – várj 15 percet.")
-        elif e.code == 401:
-            st.error("Strava token érvénytelen – csatlakozz újra.")
-        else:
-            st.error(f"Strava API hiba {e.code}: {e.reason}")
-        return None
-    except Exception as e:
-        st.error(f"Strava API kapcsolati hiba: {e}")
-        return None
-
-
-@st.cache_data(show_spinner="Strava aktivitások letöltése…", ttl=1800)
-def fetch_strava_activities(access_token: str, days_back: int = 365) -> list[dict]:
-    """
-    Letölti az utolsó `days_back` nap futó aktivitásait a Strava API-ból.
-    Cache: 30 perc (ttl=1800).
-    """
-    after_ts = int(time.time()) - days_back * 86400
-    all_acts = []
-    page = 1
-    while True:
-        batch = _strava_get(
-            "/athlete/activities",
-            access_token,
-            params={"after": after_ts, "per_page": 100, "page": page},
-        )
-        if not batch:
-            break
-        # Csak futós aktivitások
-        runs = [a for a in batch if a.get("sport_type", a.get("type", "")) in
-                ("Run", "TrailRun", "VirtualRun", "Race", "Workout")]
-        all_acts.extend(runs)
-        if len(batch) < 100:
-            break
-        page += 1
-        time.sleep(0.3)   # udvarias rate-limit
-
-    return all_acts
-
-
-def strava_activities_to_df(activities: list[dict]) -> pd.DataFrame:
-    """
-    Strava aktivitás lista → pipeline-kompatibilis DataFrame.
-
-    Konverziók:
-    - távolság: m → km
-    - tempó: average_speed (m/s) → min/km string + sec/km numerikus
-    - kadencia: Strava 2× (jobb láb) → 2×-re hagyja, a pipeline is így kapja
-    - emelkedés: total_elevation_gain → asc_m (des_m: nincs a Strava-ban → NaN)
-    - Dátum: ISO8601 string → pd.Timestamp
-    """
-    if not activities:
-        return pd.DataFrame()
-
-    rows = []
-    for a in activities:
-        dist_m = float(a.get("distance", 0) or 0)
-        dist_km = dist_m / 1000.0
-
-        dur_sec = float(a.get("moving_time", 0) or 0)
-
-        # Tempó: m/s → sec/km → min:sec string
-        avg_speed = float(a.get("average_speed", 0) or 0)
-        if avg_speed > 0:
-            pace_sec_km = 1000.0 / avg_speed
-            pace_str = sec_to_pace_str(pace_sec_km)
-        else:
-            pace_sec_km = np.nan
-            pace_str = np.nan
-
-        # Dátum – tz-naive-ra normalizálva (Garmin CSV-vel való kompatibilitáshoz)
-        date_raw = a.get("start_date_local", a.get("start_date", ""))
-        try:
-            dt = pd.to_datetime(date_raw, utc=False, errors="coerce")
-            if dt is not pd.NaT and dt.tzinfo is not None:
-                dt = dt.tz_convert("UTC").tz_localize(None)
-        except Exception:
-            dt = pd.NaT
-
-        # Kadencia (Strava: avg_cadence = lépések/perc/2 = jobb lábak → *2 = összes)
-        cad_raw = a.get("average_cadence")
-        cad_num = float(cad_raw) * 2 if cad_raw is not None else np.nan
-
-        # HR
-        hr_num = float(a.get("average_heartrate") or np.nan) if a.get("average_heartrate") else np.nan
-
-        # Power (Stryd / Garmin Running Power)
-        power_avg = float(a.get("average_watts") or np.nan) if a.get("average_watts") else np.nan
-        power_max = float(a.get("max_watts") or np.nan) if a.get("max_watts") else np.nan
-
-        # Emelkedés
-        asc_m = float(a.get("total_elevation_gain") or 0)
-
-        # Aktivitás típus → Run_type (pace alapján pontosítjuk később a pipeline-ban)
-        sport_type = a.get("sport_type", a.get("type", "Run"))
-        run_type_raw = _STRAVA_TYPE_MAP.get(sport_type, "easy")
-
-        rows.append({
-            # Pipeline által elvárt oszlopok
-            "Dátum": dt,
-            "Cím": a.get("name", ""),
-            "Tevékenység típusa": "Futás",
-            "dist_km": dist_km if dist_km > 0 else np.nan,
-            "dur_sec": dur_sec if dur_sec > 0 else np.nan,
-            "pace_sec_km": pace_sec_km,
-            "Átlagos tempó": pace_str,
-            "speed_mps": avg_speed if avg_speed > 0 else np.nan,
-            "hr_num": hr_num,
-            "Átlagos pulzusszám": hr_num,
-            "cad_num": cad_num,
-            "Átl. pedálütem": cad_num,
-            "power_avg_w": power_avg,
-            "power_max_w": power_max,
-            "Átl. teljesítmény": power_avg,
-            "Max. teljesítmény": power_max,
-            "asc_m": asc_m,
-            "des_m": np.nan,          # Strava nem adja meg
-            "Teljes emelkedés": asc_m,
-            "Teljes süllyedés": np.nan,
-            "temp_c": float(a.get("average_temp") or np.nan) if a.get("average_temp") else np.nan,
-            "Run_type": run_type_raw,
-            # Strava-specifikus extra mezők (elemzőkben hasznosak)
-            "strava_id": a.get("id"),
-            "strava_type": sport_type,
-            "suffer_score": a.get("suffer_score"),
-            "kudos_count": a.get("kudos_count"),
-            # Nincs Strava-ban (Garmin Running Dynamics):
-            "vr_num": np.nan,
-            "gct_num": np.nan,
-            "vo_num": np.nan,
-            "stride_num": np.nan,
-        })
-
-    df = pd.DataFrame(rows)
-    df = df.sort_values("Dátum").reset_index(drop=True)
-
-    # up/down m per km
-    df["up_m_per_km"] = np.where(
-        df["dist_km"].notna() & (df["dist_km"] > 0),
-        df["asc_m"] / df["dist_km"], np.nan
-    )
-    df["down_m_per_km"] = np.nan
-    df["net_elev_m"] = df["asc_m"]
-
-    # slope_bucket (csak emelkedés alapján, süllyedés hiányában)
-    df["slope_bucket"] = df["up_m_per_km"].apply(
-        lambda u: "flat" if pd.isna(u) or u < 5
-        else "rolling" if u < 15
-        else "uphill_dominant"
-    )
-
-    # temp_bin
-    df["temp_bin"] = df["temp_c"].apply(temp_bin)
-
-    # Power_fatigue_hint
-    df["Power_fatigue_hint"] = np.where(
-        df["power_avg_w"].notna() & df["power_max_w"].notna() & (df["power_avg_w"] > 0),
-        df["power_max_w"] / df["power_avg_w"], np.nan
-    )
-
-    return df
-
-
-def get_valid_strava_token(client_id: str, client_secret: str, refresh_tok: str) -> str | None:
-    """
-    Visszaadja az érvényes access_token-t.
-    - Ha a session_state-ben van és még érvényes → visszaadja
-    - Ha lejárt vagy nincs → refresh_token-nel megújítja
-    A refresh_token a Secrets-ből jön (állandó), az access_token session-szintű.
-    """
-    ss = st.session_state
-    expires_at = ss.get("strava_token_expires_at", 0)
-    now_ts = int(time.time())
-
-    if "strava_access_token" in ss and now_ts < expires_at - 300:
-        return ss["strava_access_token"]
-
-    # Megújítás a Secrets-beli refresh_token-nel
-    new_tokens = strava_refresh_token(client_id, client_secret, refresh_tok)
-    if not new_tokens or "access_token" not in new_tokens:
-        return None
-
-    ss["strava_access_token"]      = new_tokens["access_token"]
-    ss["strava_token_expires_at"]  = new_tokens["expires_at"]
-    # Ha a Strava új refresh_token-t ad (ritka), azt is mentjük session-be
-    if "refresh_token" in new_tokens:
-        ss["strava_session_refresh"] = new_tokens["refresh_token"]
-
-    return ss["strava_access_token"]
-
-
-def render_strava_connect_sidebar():
-    """
-    Strava kapcsolat UI a sidebarban – refresh_token alapú (nincs OAuth redirect).
-
-    Állapotok:
-      - Nincs secret → útmutató a get_strava_token.py scripthez
-      - Van secret, de token hiba → hibaüzenet
-      - Minden OK → kapcsolt állapot + szinkron gomb
-    """
-    client_id, client_secret, refresh_tok = _strava_secrets()
-
-    st.sidebar.divider()
-    st.sidebar.header("🟠 Strava kapcsolat")
-
-    # ---- Nincs secret
-    if not client_id or not client_secret or not refresh_tok:
-        missing = []
-        if not client_id:      missing.append("STRAVA_CLIENT_ID")
-        if not client_secret:  missing.append("STRAVA_CLIENT_SECRET")
-        if not refresh_tok:    missing.append("STRAVA_REFRESH_TOKEN")
-
-        st.sidebar.warning(
-            f"Hiányzó Secrets: **{', '.join(missing)}**\n\n"
-            "**Lépések:**\n"
-            "1. Töltsd le a `get_strava_token.py` scriptet\n"
-            "2. Futtasd a saját gépeden → megkapod a refresh_token-t\n"
-            "3. Add hozzá a Streamlit Secrets-hez:\n\n"
-            "```toml\n"
-            "STRAVA_CLIENT_ID     = \"123456\"\n"
-            "STRAVA_CLIENT_SECRET = \"abc...\"\n"
-            "STRAVA_REFRESH_TOKEN = \"def...\"\n"
-            "```"
-        )
-        return None, "garmin"
-
-    # ---- Token megszerzése / megújítása
-    # Session-szintű refresh_token (ha a Strava újat adott) vagy a Secrets-beli
-    effective_refresh = st.session_state.get("strava_session_refresh", refresh_tok)
-
-    with st.spinner("Strava kapcsolat ellenőrzése…") if "strava_access_token" not in st.session_state else st.sidebar:
-        access_token = get_valid_strava_token(client_id, client_secret, effective_refresh)
-
-    if not access_token:
-        st.sidebar.error(
-            "❌ Strava kapcsolat sikertelen.\n\n"
-            "Lehetséges okok:\n"
-            "- A STRAVA_REFRESH_TOKEN lejárt vagy érvénytelen\n"
-            "- Futtasd újra a `get_strava_token.py` scriptet\n"
-            "- Ellenőrizd a Client ID / Secret értékeket"
-        )
-        return None, "garmin"
-
-    # ---- Kapcsolt állapot
-    # Athlete neve: ha még nem töltöttük le, lekérjük egyszer
-    if "strava_athlete_name" not in st.session_state:
-        athlete_data = _strava_get("/athlete", access_token)
-        if athlete_data:
-            st.session_state["strava_athlete_name"] = (
-                f"{athlete_data.get('firstname', '')} "
-                f"{athlete_data.get('lastname', '')}".strip()
-            )
-
-    athlete_name = st.session_state.get("strava_athlete_name", "Strava sportoló")
-    st.sidebar.success(f"✅ Kapcsolódva: **{athlete_name}**")
-
-    # Szinkron időszak
-    days_back = st.sidebar.selectbox(
-        "Szinkron időszak",
-        options=[90, 180, 365, 730],
-        index=2,
-        format_func=lambda d: {90: "3 hónap", 180: "6 hónap",
-                                365: "1 év",   730: "2 év"}[d],
-        key="strava_days_back",
-    )
-
-    # Kézi frissítés gomb
-    if st.sidebar.button("🔄 Strava adatok frissítése", key="strava_refresh_btn"):
-        fetch_strava_activities.clear()
-        st.session_state.pop("strava_access_token", None)  # force token újra
-        st.rerun()
-
-    # Letöltés (30 perces cache)
-    activities = fetch_strava_activities(access_token, days_back=days_back)
-    if not activities:
-        st.sidebar.warning("Nem találtam futást a megadott időszakban.")
-        return None, "strava_empty"
-
-    strava_df = strava_activities_to_df(activities)
-    st.sidebar.caption(f"📥 {len(strava_df)} futás szinkronizálva ({days_back} nap)")
-    return strava_df, "strava"
 
 
 # =========================================================
@@ -530,6 +144,29 @@ require_password()
 # =========================================================
 # SEGÉDFÜGGVÉNYEK
 # =========================================================
+
+def parse_gct_balance_series(s: pd.Series) -> pd.Series:
+    """
+    Garmin 'Átlagos talajérintési időegyensúly' oszlopból a bal (B) lábszázalékot vonja ki.
+    Bemenet pl.: "49.6% B / 50.4% J"  →  49.6
+    Kimenet: float Series (NaN ha hiányzó / --)
+    """
+    import re
+    def _parse(v):
+        if v is None:
+            return np.nan
+        v = str(v).strip()
+        if v in ("--", "", "None", "nan"):
+            return np.nan
+        m = re.search(r"([\d.,]+)\s*%\s*B", v, re.IGNORECASE)
+        if m:
+            try:
+                return float(m.group(1).replace(",", "."))
+            except ValueError:
+                return np.nan
+        return np.nan
+    return s.apply(_parse).astype(float)
+
 
 def to_float_series(s: pd.Series) -> pd.Series:
     # Ha már numerikus dtype (float/int), nincs szükség konverzióra
@@ -777,266 +414,6 @@ def bmi(weight_kg: float, height_cm: float) -> float:
 
 
 # =========================================================
-# SZÉL MODUL – OpenWeatherMap Historical API
-# =========================================================
-
-_OWM_HISTORY_URL = "https://api.openweathermap.org/data/3.0/onecall/timemachine"
-_OWM_GEO_URL     = "https://api.openweathermap.org/geo/1.0/direct"
-
-# Futó légellenállás-modell (Pugh 1971, Davies 1980, Candau et al. 1998)
-# Energy cost of running against wind: dC = k × (v_wind)^2
-# ahol k ≈ 0.0025 J·kg⁻¹·m⁻¹ / (m/s)² frontal area normalizálva
-# Tempóveszteség sec/km egységben:
-#   dt = (k_wind × v_wind² × rho) / (m_runner × v_runner) × 1000
-# Egyszerűsített formula (Roberts et al.):
-#   pace_loss [sec/km] = (0.0371 × Vw² + 0.0316 × Vw) × (1/Vr) × 1000
-# ahol Vw = szélsebesség m/s, Vr = futó sebesség m/s
-# Hátszél: kb. 50%-os visszanyerés (aszimmetria miatt)
-
-_WIND_RHO_DEFAULT = 1.225  # kg/m³ (15°C, tengszint)
-
-
-def wind_pace_correction(
-    wind_speed_ms: float,
-    wind_deg: float,
-    runner_speed_ms: float,
-    heading_deg: float | None = None,
-) -> dict:
-    """
-    Szél-alapú tempókorrekció.
-
-    wind_speed_ms:  szélsebesség m/s-ban
-    wind_deg:       szél iránya fokokban (meteorológiai: honnan fúj, 0=É, 90=K)
-    runner_speed_ms: futó átlagsebessége m/s
-    heading_deg:    futó átlagos iránya (ha None → körkörös/változó útnak vesszük)
-
-    Visszatér: dict a korrekciókkal és magyarázattal.
-    """
-    if pd.isna(wind_speed_ms) or wind_speed_ms <= 0:
-        return {
-            "wind_speed_ms": 0, "wind_speed_kmh": 0,
-            "pace_correction_sec": 0, "hr_correction_bpm": 0,
-            "energy_cost_pct": 0, "status": "calm",
-            "description": "Szélcsendes – nincs korrekció.",
-            "headwind_component": 0,
-        }
-
-    Vw = float(wind_speed_ms)
-    Vr = max(float(runner_speed_ms), 1.0)
-
-    # Effektív szemközti szélkomponens
-    if heading_deg is not None and not pd.isna(wind_deg):
-        # Szögkülönbség futó iránya és szél iránya között
-        # Szél iránya: honnan fúj → megfordítjuk (hová fúj)
-        wind_to = (float(wind_deg) + 180) % 360
-        delta = abs(float(heading_deg) - wind_to) % 360
-        if delta > 180:
-            delta = 360 - delta
-        # cos(delta): 0° = teljes szemközti, 90° = oldalsó, 180° = teljes hátszél
-        head_factor = np.cos(np.radians(delta))
-    else:
-        # Ismeretlen irány: körkörös út, nettó ~30% szemközti hatás marad
-        head_factor = 0.30
-
-    Vw_eff = Vw * head_factor  # effektív szemközti szélkomponens (negatív = hátszél)
-
-    # Tempókorrekció (Roberts-formula alapján)
-    # Szemközti (Vw_eff > 0): pozitív korrekció = lassabb
-    # Hátszél (Vw_eff < 0): negatív korrekció = gyorsabb, de kisebb mértékben
-    if Vw_eff >= 0:
-        # Szemközti: teljes hatás
-        pace_loss = (0.0371 * Vw_eff**2 + 0.0316 * Vw_eff) / Vr * 1000
-    else:
-        # Hátszél: 50%-os visszanyerés
-        pace_gain = (0.0371 * Vw_eff**2 + 0.0316 * abs(Vw_eff)) / Vr * 1000
-        pace_loss = -pace_gain * 0.50
-
-    # HR korrekció: szélterhelés extra szívmunkát igényel
-    # Durva becslés: ~0.5 bpm per m/s szemközti szél
-    hr_corr = max(0.0, Vw_eff * 0.5)
-
-    # Energiaköltség növekedés (%)
-    energy_pct = abs(pace_loss) / (1000 / Vr) * 100 if Vr > 0 else 0
-
-    # Státusz
-    kmh = Vw * 3.6
-    if kmh < 5:
-        status = "calm"
-    elif kmh < 15:
-        status = "light"
-    elif kmh < 25:
-        status = "moderate"
-    elif kmh < 35:
-        status = "strong"
-    else:
-        status = "very_strong"
-
-    direction_txt = {
-        "calm":       "Szélcsendes",
-        "light":      f"Gyenge szél ({kmh:.0f} km/h)",
-        "moderate":   f"Közepes szél ({kmh:.0f} km/h)",
-        "strong":     f"Erős szél ({kmh:.0f} km/h)",
-        "very_strong":f"Nagyon erős szél ({kmh:.0f} km/h)",
-    }.get(status, f"{kmh:.0f} km/h")
-
-    if pace_loss > 2:
-        effect_txt = f"+{pace_loss:.0f} sec/km lassítás"
-    elif pace_loss < -2:
-        effect_txt = f"{pace_loss:.0f} sec/km gyorsítás (hátszél)"
-    else:
-        effect_txt = "minimális hatás"
-
-    return {
-        "wind_speed_ms":       Vw,
-        "wind_speed_kmh":      kmh,
-        "wind_deg":            wind_deg,
-        "headwind_component":  Vw_eff,
-        "pace_correction_sec": round(pace_loss, 1),
-        "hr_correction_bpm":   round(hr_corr, 1),
-        "energy_cost_pct":     round(energy_pct, 1),
-        "status":              status,
-        "description":         f"{direction_txt} → {effect_txt}",
-    }
-
-
-@st.cache_data(show_spinner="Időjárás lekérdezése…", ttl=3600)
-def fetch_owm_weather(
-    lat: float, lon: float, unix_ts: int, api_key: str
-) -> dict | None:
-    """
-    OpenWeatherMap One Call API 3.0 – historical időjárás lekérés.
-    Visszaadja a futás időpontjához legközelebb eső óra adatait.
-    Cache: 1 óra (az adatok nem változnak).
-    """
-    url = (
-        f"{_OWM_HISTORY_URL}"
-        f"?lat={lat}&lon={lon}&dt={unix_ts}&appid={api_key}&units=metric"
-    )
-    req = urllib.request.Request(url)
-    try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            data = json.loads(resp.read())
-        # A válasz: {"data": [...]} – az első elem a kért időpont
-        hourly = data.get("data", [data])
-        if not hourly:
-            return None
-        h = hourly[0]
-        return {
-            "temp_c":        h.get("temp"),
-            "feels_like":    h.get("feels_like"),
-            "humidity":      h.get("humidity"),
-            "wind_speed_ms": h.get("wind_speed"),
-            "wind_gust_ms":  h.get("wind_gust"),
-            "wind_deg":      h.get("wind_deg"),
-            "weather_desc":  h.get("weather", [{}])[0].get("description", ""),
-            "clouds":        h.get("clouds"),
-            "unix_ts":       h.get("dt"),
-        }
-    except urllib.error.HTTPError as e:
-        if e.code == 401:
-            st.warning("⚠️ OWM API kulcs érvénytelen – ellenőrizd a Secrets-ben.")
-        elif e.code == 429:
-            st.warning("⚠️ OWM API rate limit – várj egy percet.")
-        else:
-            st.warning(f"⚠️ OWM API hiba {e.code}")
-        return None
-    except Exception as e:
-        st.warning(f"⚠️ Időjárás lekérés sikertelen: {e}")
-        return None
-
-
-@st.cache_data(show_spinner="Helyszín koordináták…", ttl=86400)
-def owm_geocode(city: str, api_key: str) -> tuple[float, float] | None:
-    """Városnév → (lat, lon) az OWM Geocoding API-val."""
-    url = f"{_OWM_GEO_URL}?q={urllib.parse.quote(city)}&limit=1&appid={api_key}"
-    req = urllib.request.Request(url)
-    try:
-        with urllib.request.urlopen(req, timeout=8) as resp:
-            results = json.loads(resp.read())
-        if results:
-            return float(results[0]["lat"]), float(results[0]["lon"])
-    except Exception:
-        pass
-    return None
-
-
-def enrich_df_with_weather(
-    df: pd.DataFrame,
-    api_key: str,
-    lat: float,
-    lon: float,
-    runner_speed_col: str = "speed_mps",
-) -> pd.DataFrame:
-    """
-    DataFrame-re alkalmazza az időjárás-lekérést és szél-korrekciót.
-    Minden futáshoz lekéri az OWM adatokat (cache-elve), majd kiszámolja
-    a szél-korrigált tempót.
-
-    Hozzáadott oszlopok:
-      wind_speed_ms, wind_speed_kmh, wind_deg, wind_pace_corr_sec,
-      wind_hr_corr_bpm, pace_wind_adj_sec, owm_temp_c, owm_weather
-    """
-    out = df.copy()
-    if "Dátum" not in out.columns or api_key is None:
-        return out
-
-    # Inicializálás
-    for col in ["wind_speed_ms", "wind_speed_kmh", "wind_deg",
-                "wind_pace_corr_sec", "wind_hr_corr_bpm",
-                "pace_wind_adj_sec", "owm_temp_c", "owm_weather"]:
-        out[col] = np.nan
-
-    processed = set()
-    for idx, row in out.iterrows():
-        dt = row["Dátum"]
-        if pd.isna(dt):
-            continue
-        # Nap-szinten cache-elünk (nem minden futáshoz hívunk API-t)
-        day_key = dt.date() if hasattr(dt, "date") else dt
-        if day_key in processed:
-            # Ugyanazon nap: előző adat másolása
-            prev = out[out["Dátum"].dt.date == day_key].iloc[0] \
-                if hasattr(dt, "date") else None
-            if prev is not None:
-                for col in ["wind_speed_ms", "wind_speed_kmh", "wind_deg",
-                            "owm_temp_c", "owm_weather"]:
-                    out.at[idx, col] = prev.get(col, np.nan)
-            continue
-
-        unix_ts = int(dt.timestamp())
-        weather = fetch_owm_weather(lat, lon, unix_ts, api_key)
-        if weather is None:
-            processed.add(day_key)
-            continue
-
-        out.at[idx, "wind_speed_ms"]  = weather.get("wind_speed_ms")
-        out.at[idx, "wind_speed_kmh"] = (weather.get("wind_speed_ms") or 0) * 3.6
-        out.at[idx, "wind_deg"]       = weather.get("wind_deg")
-        out.at[idx, "owm_temp_c"]     = weather.get("temp_c")
-        out.at[idx, "owm_weather"]    = weather.get("weather_desc", "")
-
-        # Szél-korrekció
-        Vr = float(row.get(runner_speed_col, 0) or 0)
-        if Vr > 0 and weather.get("wind_speed_ms") is not None:
-            wc = wind_pace_correction(
-                wind_speed_ms=weather["wind_speed_ms"],
-                wind_deg=weather.get("wind_deg", 0),
-                runner_speed_ms=Vr,
-                heading_deg=None,  # ismeretlen → körkörös becslés
-            )
-            out.at[idx, "wind_pace_corr_sec"] = wc["pace_correction_sec"]
-            out.at[idx, "wind_hr_corr_bpm"]   = wc["hr_correction_bpm"]
-            if pd.notna(row.get("pace_sec_km")) and row["pace_sec_km"] > 0:
-                out.at[idx, "pace_wind_adj_sec"] = (
-                    row["pace_sec_km"] - wc["pace_correction_sec"]
-                )
-
-        processed.add(day_key)
-
-    return out
-
-
-# =========================================================
 # VERSENYIDŐ BECSLŐ (Riegel + forma-korrekció)
 # =========================================================
 
@@ -1169,6 +546,243 @@ def race_time_table(known_dist: str, known_time_sec: float,
 
 
 # =========================================================
+# SZÉL MODUL – OpenWeatherMap Historical API
+# =========================================================
+
+_OWM_HISTORY_URL = "https://api.openweathermap.org/data/3.0/onecall/timemachine"
+_OWM_GEO_URL     = "https://api.openweathermap.org/geo/1.0/direct"
+
+# Futó légellenállás-modell (Pugh 1971, Davies 1980, Candau et al. 1998)
+# Tempóveszteség sec/km egységben:
+#   dt = (0.0371 × Vw² + 0.0316 × Vw) × (1/Vr) × 1000
+# ahol Vw = szélsebesség m/s, Vr = futó sebesség m/s
+# Hátszél: kb. 50%-os visszanyerés (aszimmetria miatt)
+
+_WIND_RHO_DEFAULT = 1.225  # kg/m³ (15°C, tengszint)
+
+
+def wind_pace_correction(
+    wind_speed_ms: float,
+    wind_deg: float,
+    runner_speed_ms: float,
+    heading_deg: float | None = None,
+) -> dict:
+    """
+    Szél-alapú tempókorrekció.
+
+    wind_speed_ms:  szélsebesség m/s-ban
+    wind_deg:       szél iránya fokokban (meteorológiai: honnan fúj, 0=É, 90=K)
+    runner_speed_ms: futó átlagsebessége m/s
+    heading_deg:    futó átlagos iránya (ha None → körkörös/változó útnak vesszük)
+
+    Visszatér: dict a korrekciókkal és magyarázattal.
+    """
+    if pd.isna(wind_speed_ms) or wind_speed_ms <= 0:
+        return {
+            "wind_speed_ms": 0, "wind_speed_kmh": 0,
+            "pace_correction_sec": 0, "hr_correction_bpm": 0,
+            "energy_cost_pct": 0, "status": "calm",
+            "description": "Szélcsendes – nincs korrekció.",
+            "headwind_component": 0,
+        }
+
+    Vw = float(wind_speed_ms)
+    Vr = max(float(runner_speed_ms), 1.0)
+
+    # Effektív szemközti szélkomponens
+    if heading_deg is not None and not pd.isna(wind_deg):
+        wind_to = (float(wind_deg) + 180) % 360
+        delta = abs(float(heading_deg) - wind_to) % 360
+        if delta > 180:
+            delta = 360 - delta
+        head_factor = np.cos(np.radians(delta))
+    else:
+        head_factor = 0.30
+
+    Vw_eff = Vw * head_factor
+
+    if Vw_eff >= 0:
+        pace_loss = (0.0371 * Vw_eff**2 + 0.0316 * Vw_eff) / Vr * 1000
+    else:
+        pace_gain = (0.0371 * Vw_eff**2 + 0.0316 * abs(Vw_eff)) / Vr * 1000
+        pace_loss = -pace_gain * 0.50
+
+    hr_corr = max(0.0, Vw_eff * 0.5)
+    energy_pct = abs(pace_loss) / (1000 / Vr) * 100 if Vr > 0 else 0
+
+    kmh = Vw * 3.6
+    if kmh < 5:
+        status = "calm"
+    elif kmh < 15:
+        status = "light"
+    elif kmh < 25:
+        status = "moderate"
+    elif kmh < 35:
+        status = "strong"
+    else:
+        status = "very_strong"
+
+    direction_txt = {
+        "calm":       "Szélcsendes",
+        "light":      f"Gyenge szél ({kmh:.0f} km/h)",
+        "moderate":   f"Közepes szél ({kmh:.0f} km/h)",
+        "strong":     f"Erős szél ({kmh:.0f} km/h)",
+        "very_strong":f"Nagyon erős szél ({kmh:.0f} km/h)",
+    }.get(status, f"{kmh:.0f} km/h")
+
+    if pace_loss > 2:
+        effect_txt = f"+{pace_loss:.0f} sec/km lassítás"
+    elif pace_loss < -2:
+        effect_txt = f"{pace_loss:.0f} sec/km gyorsítás (hátszél)"
+    else:
+        effect_txt = "minimális hatás"
+
+    return {
+        "wind_speed_ms":       Vw,
+        "wind_speed_kmh":      kmh,
+        "wind_deg":            wind_deg,
+        "headwind_component":  Vw_eff,
+        "pace_correction_sec": round(pace_loss, 1),
+        "hr_correction_bpm":   round(hr_corr, 1),
+        "energy_cost_pct":     round(energy_pct, 1),
+        "status":              status,
+        "description":         f"{direction_txt} → {effect_txt}",
+    }
+
+
+@st.cache_data(show_spinner="Időjárás lekérdezése…", ttl=3600)
+def fetch_owm_weather(
+    lat: float, lon: float, unix_ts: int, api_key: str
+) -> dict | None:
+    """
+    OpenWeatherMap One Call API 3.0 – historical időjárás lekérés.
+    Visszaadja a futás időpontjához legközelebb eső óra adatait.
+    Cache: 1 óra (az adatok nem változnak).
+    """
+    url = (
+        f"{_OWM_HISTORY_URL}"
+        f"?lat={lat}&lon={lon}&dt={unix_ts}&appid={api_key}&units=metric"
+    )
+    req = urllib.request.Request(url)
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read())
+        hourly = data.get("data", [data])
+        if not hourly:
+            return None
+        h = hourly[0]
+        return {
+            "temp_c":        h.get("temp"),
+            "feels_like":    h.get("feels_like"),
+            "humidity":      h.get("humidity"),
+            "wind_speed_ms": h.get("wind_speed"),
+            "wind_gust_ms":  h.get("wind_gust"),
+            "wind_deg":      h.get("wind_deg"),
+            "weather_desc":  h.get("weather", [{}])[0].get("description", ""),
+            "clouds":        h.get("clouds"),
+            "unix_ts":       h.get("dt"),
+        }
+    except urllib.error.HTTPError as e:
+        if e.code == 401:
+            st.warning("⚠️ OWM API kulcs érvénytelen – ellenőrizd a Secrets-ben.")
+        elif e.code == 429:
+            st.warning("⚠️ OWM API rate limit – várj egy percet.")
+        else:
+            st.warning(f"⚠️ OWM API hiba {e.code}")
+        return None
+    except Exception as e:
+        st.warning(f"⚠️ Időjárás lekérés sikertelen: {e}")
+        return None
+
+
+@st.cache_data(show_spinner="Helyszín koordináták…", ttl=86400)
+def owm_geocode(city: str, api_key: str) -> tuple[float, float] | None:
+    """Városnév → (lat, lon) az OWM Geocoding API-val."""
+    url = f"{_OWM_GEO_URL}?q={urllib.parse.quote(city)}&limit=1&appid={api_key}"
+    req = urllib.request.Request(url)
+    try:
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            results = json.loads(resp.read())
+        if results:
+            return float(results[0]["lat"]), float(results[0]["lon"])
+    except Exception:
+        pass
+    return None
+
+
+def enrich_df_with_weather(
+    df: pd.DataFrame,
+    api_key: str,
+    lat: float,
+    lon: float,
+    runner_speed_col: str = "speed_mps",
+) -> pd.DataFrame:
+    """
+    DataFrame-re alkalmazza az időjárás-lekérést és szél-korrekciót.
+    Minden futáshoz lekéri az OWM adatokat (cache-elve), majd kiszámolja
+    a szél-korrigált tempót.
+
+    Hozzáadott oszlopok:
+      wind_speed_ms, wind_speed_kmh, wind_deg, wind_pace_corr_sec,
+      wind_hr_corr_bpm, pace_wind_adj_sec, owm_temp_c, owm_weather
+    """
+    out = df.copy()
+    if "Dátum" not in out.columns or api_key is None:
+        return out
+
+    for col in ["wind_speed_ms", "wind_speed_kmh", "wind_deg",
+                "wind_pace_corr_sec", "wind_hr_corr_bpm",
+                "pace_wind_adj_sec", "owm_temp_c", "owm_weather"]:
+        out[col] = np.nan
+
+    processed = set()
+    for idx, row in out.iterrows():
+        dt = row["Dátum"]
+        if pd.isna(dt):
+            continue
+        day_key = dt.date() if hasattr(dt, "date") else dt
+        if day_key in processed:
+            prev = out[out["Dátum"].dt.date == day_key].iloc[0] \
+                if hasattr(dt, "date") else None
+            if prev is not None:
+                for col in ["wind_speed_ms", "wind_speed_kmh", "wind_deg",
+                            "owm_temp_c", "owm_weather"]:
+                    out.at[idx, col] = prev.get(col, np.nan)
+            continue
+
+        unix_ts = int(dt.timestamp())
+        weather = fetch_owm_weather(lat, lon, unix_ts, api_key)
+        if weather is None:
+            processed.add(day_key)
+            continue
+
+        out.at[idx, "wind_speed_ms"]  = weather.get("wind_speed_ms")
+        out.at[idx, "wind_speed_kmh"] = (weather.get("wind_speed_ms") or 0) * 3.6
+        out.at[idx, "wind_deg"]       = weather.get("wind_deg")
+        out.at[idx, "owm_temp_c"]     = weather.get("temp_c")
+        out.at[idx, "owm_weather"]    = weather.get("weather_desc", "")
+
+        Vr = float(row.get(runner_speed_col, 0) or 0)
+        if Vr > 0 and weather.get("wind_speed_ms") is not None:
+            wc = wind_pace_correction(
+                wind_speed_ms=weather["wind_speed_ms"],
+                wind_deg=weather.get("wind_deg", 0),
+                runner_speed_ms=Vr,
+                heading_deg=None,
+            )
+            out.at[idx, "wind_pace_corr_sec"] = wc["pace_correction_sec"]
+            out.at[idx, "wind_hr_corr_bpm"]   = wc["hr_correction_bpm"]
+            if pd.notna(row.get("pace_sec_km")) and row["pace_sec_km"] > 0:
+                out.at[idx, "pace_wind_adj_sec"] = (
+                    row["pace_sec_km"] - wc["pace_correction_sec"]
+                )
+
+        processed.add(day_key)
+
+    return out
+
+
+# =========================================================
 # HŐMÉRSÉKLET-KORREKCIÓ
 # =========================================================
 
@@ -1267,8 +881,6 @@ def _safe_dropna(df: pd.DataFrame, subset: list[str]) -> pd.DataFrame:
     """
     dropna mint a pandas-é, de csak a ténylegesen létező oszlopokra alkalmazza.
     Ha egy oszlop nem létezik a df-ben, azt a szűrési feltételt kihagyja.
-    Strava módban (pl. Technika_index hiányzik) így nem dob KeyError-t,
-    és az eredmény egy üres df lesz ha az egyetlen subset-col hiányzik.
     """
     existing = [c for c in subset if c in df.columns]
     missing  = [c for c in subset if c not in df.columns]
@@ -1486,9 +1098,8 @@ def daily_coach_summary(
     if base_all is None or len(base_all) == 0:
         return "ℹ️", "Nincs elég adat a napi összképhez."
 
-    # Strava módban Technika_index nem létezik → nincs coach üzenet
     if "Technika_index" not in base_all.columns or base_all["Technika_index"].notna().sum() < 5:
-        return "ℹ️", "Technika_index nem elérhető (Strava módban GCT/VO/VR hiányzik). Tölts fel Garmin exportot is a teljes elemzéshez."
+        return "ℹ️", "Technika_index nem elérhető (GCT/VO/VR adatok hiányoznak)."
 
     b = _safe_dropna(base_all, ["Dátum", "Technika_index"]).sort_values("Dátum")
     if len(b) < 5:
@@ -2215,13 +1826,17 @@ def compute_asymmetry(df: pd.DataFrame) -> pd.DataFrame:
             np.nan,
         )
 
-    # GCT
-    lc = next((c for c in df.columns if "bal" in c.lower() and "gct" in c.lower()), None)
-    rc = next((c for c in df.columns if "jobb" in c.lower() and "gct" in c.lower()), None)
-    result["asym_gct_pct"] = (
-        pd.Series(_asym_pct(to_float_series(df[lc]), to_float_series(df[rc])), index=df.index)
-        if lc and rc else np.nan
-    )
+    # GCT egyensúly – "gct_bal_left" a pipeline által parsolt bal lábszázalék
+    if "gct_bal_left" in df.columns and df["gct_bal_left"].notna().any():
+        result["asym_gct_pct"] = (np.abs(df["gct_bal_left"] - 50.0) * 2).clip(0, 20)
+    else:
+        # fallback: ha külön bal/jobb GCT oszlop elérhető (pl. XLSX export)
+        lc = next((c for c in df.columns if "bal" in c.lower() and "gct" in c.lower()), None)
+        rc = next((c for c in df.columns if "jobb" in c.lower() and "gct" in c.lower()), None)
+        result["asym_gct_pct"] = (
+            pd.Series(_asym_pct(to_float_series(df[lc]), to_float_series(df[rc])), index=df.index)
+            if lc and rc else np.nan
+        )
 
     # Lépéshossz
     lc = next((c for c in df.columns if "bal" in c.lower() and ("lépés" in c.lower() or "stride" in c.lower())), None)
@@ -2231,8 +1846,13 @@ def compute_asymmetry(df: pd.DataFrame) -> pd.DataFrame:
         if lc and rc else np.nan
     )
 
-    # Power balance
-    bal_col = next((c for c in df.columns if "egyensúly" in c.lower() or "balance" in c.lower()), None)
+    # Power balance – csak "teljesítmény" vagy "power" tartalmú egyensúly oszlop, nem a GCT
+    bal_col = next(
+        (c for c in df.columns
+         if ("egyensúly" in c.lower() or "balance" in c.lower())
+         and "talajérintési" not in c.lower()),
+        None,
+    )
     result["asym_power_pct"] = (
         np.abs(to_float_series(df[bal_col]) - 50.0) * 2 if bal_col else np.nan
     )
@@ -2462,7 +2082,7 @@ NUM_MAP = {
 
 
 @st.cache_data(show_spinner="Adatok feldolgozása…")
-def full_pipeline(file_bytes: bytes, file_name: str, _v: int = 4) -> pd.DataFrame:
+def full_pipeline(file_bytes: bytes, file_name: str, _v: int = 3) -> pd.DataFrame:
     """
     Teljes adatfeldolgozás egyszerre, cache-elve.
     Csak akkor fut újra, ha a fájl megváltozik.
@@ -2500,6 +2120,14 @@ def full_pipeline(file_bytes: bytes, file_name: str, _v: int = 4) -> pd.DataFram
     # --- Numerikus oszlopok
     for src, dst in NUM_MAP.items():
         df[dst] = to_float_series(df[src]) if src in df.columns else np.nan
+
+    # --- GCT egyensúly (bal lábszázalék): "49.6% B / 50.4% J" → 49.6
+    _gct_bal_col = next(
+        (c for c in df.columns if "talajérintési" in c.lower() and "egyensúly" in c.lower()), None
+    )
+    df["gct_bal_left"] = (
+        parse_gct_balance_series(df[_gct_bal_col]) if _gct_bal_col else np.nan
+    )
 
     df["pace_sec_km"] = (
         df["Átlagos tempó"].apply(pace_to_sec_per_km)
@@ -2632,13 +2260,11 @@ def full_pipeline(file_bytes: bytes, file_name: str, _v: int = 4) -> pd.DataFram
             if g[_str].notna().sum() >= min_n:
                 target.loc[idx, "skill_stride"] = robust_z(g[_str], g[_str])
 
-        # 1. lépés: speed_bin + slope_bucket kombináció
         grouped = tech_base.groupby(["speed_bin", "slope_bucket"], dropna=False)
         for _, g in grouped:
             if len(g) >= CFG["tech_min_group"]:
                 _fill_tech_group(g, tech_base)
 
-        # 2. lépés: fallback – csak speed_bin (slope nélkül)
         still_nan = (
             tech_base["skill_vr"].isna()
             & tech_base["skill_gct"].isna()
@@ -2647,55 +2273,18 @@ def full_pipeline(file_bytes: bytes, file_name: str, _v: int = 4) -> pd.DataFram
         )
         if still_nan.any():
             for _, g in tech_base[still_nan].groupby("speed_bin"):
-                if len(g) >= CFG["tech_min_group"]:
-                    _fill_tech_group(g, tech_base)
+                _fill_tech_group(g, tech_base)
 
-        # 3. lépés: globális fallback – ha még mindig NaN (nagyon ritka speed_bin)
-        still_nan2 = (
-            tech_base["skill_vr"].isna()
-            & tech_base["skill_gct"].isna()
-            & tech_base["skill_vo"].isna()
-            & tech_base["skill_cad"].isna()
-        )
-        if still_nan2.any():
-            _fill_tech_group(tech_base, tech_base)
-
-        # Raw score számítás
         w = CFG["tech_weights"]
         raw = (
-            w["vr"]     * tech_base["skill_vr"].fillna(0)
-            + w["gct"]  * tech_base["skill_gct"].fillna(0)
-            + w["vo"]   * tech_base["skill_vo"].fillna(0)
-            + w["cad"]  * tech_base["skill_cad"].fillna(0)
+            w["vr"] * tech_base["skill_vr"].fillna(0)
+            + w["gct"] * tech_base["skill_gct"].fillna(0)
+            + w["vo"] * tech_base["skill_vo"].fillna(0)
+            + w["cad"] * tech_base["skill_cad"].fillna(0)
             + w["stride"] * tech_base["skill_stride"].fillna(0)
         )
-
-        # Skill coverage: ha egy sorban minden skill NaN volt → index NaN legyen
-        skill_coverage = (
-            tech_base["skill_vr"].notna().astype(int)
-            + tech_base["skill_gct"].notna().astype(int)
-            + tech_base["skill_vo"].notna().astype(int)
-            + tech_base["skill_cad"].notna().astype(int)
-        )
-        no_skill = skill_coverage == 0
-
-        # p5/p95 csak az érvényes sorokból
-        valid_raw = raw[~no_skill]
-        if len(valid_raw) >= 10:
-            p5  = float(np.nanpercentile(valid_raw, 5))
-            p95 = float(np.nanpercentile(valid_raw, 95))
-        else:
-            p5, p95 = float(np.nanmin(raw)), float(np.nanmax(raw))
-
-        p_range = p95 - p5
-        if p_range < 1.0:
-            # Szűk tartomány (pl. mind azonos érték) → 50-es középérték
-            tech_vals = np.where(no_skill, np.nan, 50.0)
-        else:
-            tech_vals = (100.0 * (raw - p5) / p_range).clip(0, 100)
-            tech_vals = np.where(no_skill, np.nan, tech_vals)
-
-        tech_base["Technika_index"] = tech_vals
+        p5, p95 = np.nanpercentile(raw, 5), np.nanpercentile(raw, 95)
+        tech_base["Technika_index"] = (100 * (raw - p5) / (p95 - p5 + 1e-9)).clip(0, 100)
         df.loc[tech_base.index, "Technika_index"] = tech_base["Technika_index"].values
 
     # =========================================================
@@ -2886,161 +2475,30 @@ def full_pipeline(file_bytes: bytes, file_name: str, _v: int = 4) -> pd.DataFram
 
 
 # =========================================================
-# ADATFORRÁS: STRAVA (auto) + GARMIN CSV (manuális / kiegészítő)
+# ADATFORRÁS: GARMIN CSV feltöltés
 # =========================================================
 st.sidebar.header("Adatforrás")
-
-# --- Strava auto-szinkron
-strava_df, strava_source = render_strava_connect_sidebar()
-
-# --- Garmin CSV feltöltő (mindig látható, kiegészítő forrásként)
-st.sidebar.divider()
 st.sidebar.header("📂 Garmin CSV / XLSX")
-st.sidebar.caption(
-    "Running Dynamics adatokhoz (GCT, VO, VR) szükséges. "
-    "Strava-val kombinálva a teljes elemzés elérhető."
-)
 uploaded = st.sidebar.file_uploader(
     "Garmin export (XLSX ajánlott)", type=["xlsx", "csv"]
 )
 
-# --- Forrás döntési logika
-#   1. Ha van Strava ÉS Garmin: merge (Garmin adat bővíti a Strava-t Running Dynamics-szel)
-#   2. Ha csak Strava: Strava alapú elemzés (Technika_index/Fatigue korlátozott)
-#   3. Ha csak Garmin: eredeti működés
-#   4. Egyik sem: welcome screen
-
-def _merge_strava_garmin(strava_df: pd.DataFrame, garmin_df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Strava + Garmin adatok összeolvasztása dátum alapján.
-    A Garmin adat elsőbbséget élvez – ha ugyanarra a napra van mindkettő,
-    a Garmin Running Dynamics mezői (GCT, VO, VR, stride) feltöltik a Strava sort.
-    """
-    if strava_df.empty:
-        return garmin_df
-    if garmin_df.empty:
-        return strava_df
-
-    s = strava_df.copy()
-    g = garmin_df.copy()
-
-    # ── Timezone normalizálás: mindkettőt timezone-naive UTC-re hozzuk ──
-    # Strava: lehet tz-aware (pl. 2024-01-15 08:30:00+01:00)
-    # Garmin: tz-naive
-    # Megoldás: mindkettőből eltávolítjuk a timezone infót (.dt.tz_localize(None))
-    for _df in (s, g):
-        if "Dátum" in _df.columns:
-            dt = pd.to_datetime(_df["Dátum"], errors="coerce")
-            if dt.dt.tz is not None:
-                dt = dt.dt.tz_convert("UTC").dt.tz_localize(None)
-            _df["Dátum"] = dt
-
-    # Nap-szintű egyeztetés
-    s["_date"] = s["Dátum"].dt.date
-    g["_date"] = g["Dátum"].dt.date
-
-    # Garmin Running Dynamics oszlopok amik hiányoznak Stravából
-    rd_cols = [c for c in ["vr_num", "gct_num", "vo_num", "stride_num",
-                           "asym_gct_pct", "asym_stride_pct", "asym_power_pct", "Asymmetry_score"]
-               if c in g.columns]
-
-    if rd_cols:
-        g_rd = g[["_date"] + rd_cols].copy()
-        s = s.merge(g_rd, on="_date", how="left", suffixes=("", "_garmin"))
-        for col in rd_cols:
-            garmin_col = f"{col}_garmin"
-            if garmin_col in s.columns:
-                s[col] = s[col].combine_first(s[garmin_col])
-                s.drop(columns=[garmin_col], inplace=True)
-
-    s.drop(columns=["_date"], inplace=True, errors="ignore")
-
-    # Garmin-only sorok (napok amik Stravában nem szerepelnek)
-    s_dates = set(s["Dátum"].dt.date)
-    g_only = g[~g["_date"].isin(s_dates)].drop(columns=["_date"], errors="ignore")
-    merged = pd.concat([s, g_only], ignore_index=True).sort_values("Dátum")
-    return merged
-
-
-# --- Adatforrás összerakása
-if strava_df is None and uploaded is None:
+if uploaded is None:
     st.title("🏃 Garmin Futás Dashboard")
-    col_l, col_r = st.columns(2)
-    with col_l:
-        st.markdown("### 🟠 Automatikus szinkron")
-        st.info(
-            "Csatlakozz Stravához a bal oldali sávban – "
-            "minden futásod automatikusan betöltődik, "
-            "CSV feltöltés nélkül."
-        )
-    with col_r:
-        st.markdown("### 📂 Manuális feltöltés")
-        st.info(
-            "Vagy tölts fel egy Garmin Connect XLSX exportot. "
-            "Ez szükséges a teljes biomechanikai elemzéshez "
-            "(GCT, VO, VR, aszimmetria)."
-        )
+    st.info(
+        "Tölts fel egy Garmin Connect XLSX vagy CSV exportot a bal oldali sávban az elemzés megkezdéséhez."
+    )
     st.stop()
 
 with st.spinner("Adatok feldolgozása…"):
-    if strava_df is not None and uploaded is not None:
-        # Hibrid: Garmin CSV teljes pipeline → majd merge a Strava adatokkal
-        file_bytes = uploaded.getvalue()
-        garmin_df = full_pipeline(file_bytes, uploaded.name, _v=4)
-        # Merge: Strava adja az alapot, Garmin Running Dynamics kiegészíti
-        df = _merge_strava_garmin(strava_df, garmin_df)
-        # A merge után újrafuttatjuk a pipeline post-feldolgozást az egyesített df-en
-        # hogy a Technika_index, Fatigue_score, RES+ a teljes adatkészleten számolódjon
-        df = full_pipeline(
-            df.to_csv(index=False).encode("utf-8"), "__hybrid__.csv", _v=4
-        ) if False else garmin_df  # fallback: garmin_df-et használjuk alapnak
-        # Valódi megoldás: a garmin_df már tartalmaz mindent, a Strava csak kiegészít
-        # Strava-only sorok hozzáadása (napok amik csak Stravában vannak)
-        garmin_dates = set(garmin_df["Dátum"].dt.date) if "Dátum" in garmin_df.columns else set()
-        if "Dátum" in strava_df.columns:
-            strava_only = strava_df[
-                ~strava_df["Dátum"].dt.date.isin(garmin_dates)
-            ].copy()
-            if len(strava_only) > 0:
-                strava_only["TSS_proxy"] = compute_tss_proxy(strava_only, hrmax=185)
-                strava_only = compute_asymmetry(strava_only)
-                df = pd.concat([garmin_df, strava_only], ignore_index=True).sort_values("Dátum")
-            else:
-                df = garmin_df.copy()
-        else:
-            df = garmin_df.copy()
-        _data_source = "hybrid"
-
-    elif strava_df is not None:
-        # Csak Strava
-        df = strava_df.copy()
-        df["TSS_proxy"] = compute_tss_proxy(df, hrmax=185)
-        df = compute_asymmetry(df)
-        _data_source = "strava"
-
-    else:
-        # Csak Garmin CSV
-        file_bytes = uploaded.getvalue()
-        df = full_pipeline(file_bytes, uploaded.name, _v=4)
-        _data_source = "garmin"
+    file_bytes = uploaded.getvalue()
+    df = full_pipeline(file_bytes, uploaded.name, _v=3)
+    _data_source = "garmin"
 
 # =========================================================
 # ALAP SZŰRÉS + MEGJELENÍTÉSI ELŐKÉSZÍTÉS
 # =========================================================
 st.title("🏃 Garmin Futás Dashboard")
-
-# Adatforrás badge
-if _data_source == "strava":
-    st.info(
-        "🟠 **Strava alapú elemzés** – Running Dynamics adatok (GCT, VO, VR) hiányoznak. "
-        "Technika_index és Fatigue_score nem számolható. "
-        "Tölts fel Garmin XLSX exportot is a teljes elemzéshez.",
-    )
-elif _data_source == "hybrid":
-    st.success(
-        "✅ **Hibrid mód** – Strava automatikus szinkron + Garmin Running Dynamics. "
-        "Minden elemzés elérhető.",
-    )
 
 if "Dátum" not in df.columns:
     st.error("Nem találom a 'Dátum' oszlopot.")
@@ -3157,7 +2615,6 @@ if not _owm_key:
     )
     _owm_enabled = False
 else:
-    # Koordináták meghatározása
     if _owm_lat and _owm_lon:
         _owm_coords = (float(_owm_lat), float(_owm_lon))
     else:
@@ -3250,11 +2707,11 @@ view = d.loc[mask].copy().sort_values("Dátum")
 # =========================================================
 # TABOK
 # =========================================================
-tab_overview, tab_last, tab_warn, tab_ready, tab_pmc, tab_recovery, tab_asym, tab_race, tab_heat, tab_strava, tab_strava_analysis, tab_ai, tab_data = st.tabs(
+tab_overview, tab_last, tab_warn, tab_ready, tab_pmc, tab_recovery, tab_asym, tab_race, tab_heat, tab_ai, tab_data = st.tabs(
     ["📌 Áttekintés", "🔎 Utolsó futás", "🚦 Warning", "🏁 Readiness",
      "📈 PMC & Kockázat", "🔄 Recovery", "⚖️ Aszimmetria",
      "🏆 Versenyidő", "🌡️ Hőkorrekció",
-     "🟠 Strava adatok", "🟠 Strava elemzés", "🤖 AI Edző", "📄 Adatok"]
+     "🤖 AI Edző", "📄 Adatok"]
 )
 
 # =========================================================
@@ -4828,7 +4285,7 @@ with tab_asym:
 
     asym_available = any(
         c in d.columns and d[c].notna().any()
-        for c in ["asym_gct_pct", "asym_stride_pct", "asym_power_pct", "Asymmetry_score"]
+        for c in ["asym_gct_pct", "asym_stride_pct", "asym_power_pct", "Asymmetry_score", "gct_bal_left"]
     )
 
     if not asym_available:
@@ -4850,11 +4307,16 @@ with tab_asym:
 
         if last_asym is not None:
             asym_val = float(last_asym["Asymmetry_score"])
-            c1, c2, c3, c4 = st.columns(4)
+            c1, c2, c3, c4, c5 = st.columns(5)
             c1.metric("Összesített aszimmetria", f"{asym_val:.1f}%")
             c2.metric("GCT aszimmetria", f"{float(last_asym.get('asym_gct_pct', np.nan)):.1f}%" if pd.notna(last_asym.get("asym_gct_pct")) else "—")
             c3.metric("Lépéshossz aszimmetria", f"{float(last_asym.get('asym_stride_pct', np.nan)):.1f}%" if pd.notna(last_asym.get("asym_stride_pct")) else "—")
             c4.metric("Power balance eltérés", f"{float(last_asym.get('asym_power_pct', np.nan)):.1f}%" if pd.notna(last_asym.get("asym_power_pct")) else "—")
+            _gct_bal = last_asym.get("gct_bal_left") if "gct_bal_left" in last_asym.index else np.nan
+            if pd.notna(_gct_bal):
+                _gct_bal = float(_gct_bal)
+                c5.metric("GCT bal/jobb arány", f"{_gct_bal:.1f}% B / {100-_gct_bal:.1f}% J",
+                          help="Talajérintési időegyensúly: 50% B / 50% J az ideális szimmetria")
 
             if asym_val >= CFG["asym_red_pct"]:
                 st.error(f"🔴 Magas aszimmetria ({asym_val:.1f}%) – sérülésprediktív jel. Javasolt: erősítő edzés + fizioterápiás konzultáció.")
@@ -4866,7 +4328,7 @@ with tab_asym:
         st.divider()
 
         # --- Aszimmetria idősor
-        asym_cols_present = [c for c in ["asym_gct_pct", "asym_stride_pct", "asym_power_pct", "Asymmetry_score"]
+        asym_cols_present = [c for c in ["asym_gct_pct", "asym_stride_pct", "asym_power_pct", "Asymmetry_score", "gct_bal_left"]
                              if c in asym_base.columns and asym_base[c].notna().any()]
 
         if asym_cols_present:
@@ -4875,6 +4337,7 @@ with tab_asym:
                 "asym_stride_pct": "Lépéshossz aszimmetria (%)",
                 "asym_power_pct": "Power balance eltérés (%)",
                 "Asymmetry_score": "Összesített aszimmetria (%)",
+                "gct_bal_left": "GCT bal lábszázalék (50% = szimmetria)",
             }
             sel_asym = st.selectbox(
                 "Melyik aszimmetria mutatót nézzük?",
@@ -4905,10 +4368,20 @@ with tab_asym:
                     tr.showlegend = True
                     fig_asym.add_trace(tr)
 
-            fig_asym.add_hline(y=CFG["asym_warn_pct"], line_dash="dot", line_color="orange",
-                                annotation_text=f"Figyelmeztetés ({CFG['asym_warn_pct']}%)")
-            fig_asym.add_hline(y=CFG["asym_red_pct"], line_dash="dot", line_color="red",
-                                annotation_text=f"Kockázati küszöb ({CFG['asym_red_pct']}%)")
+            if sel_asym == "gct_bal_left":
+                fig_asym.add_hline(y=50.0, line_dash="dash", line_color="green",
+                                    annotation_text="Tökéletes szimmetria (50%)")
+                fig_asym.add_hline(y=51.5, line_dash="dot", line_color="orange",
+                                    annotation_text="Figyelmeztetés (±1.5%)")
+                fig_asym.add_hline(y=48.5, line_dash="dot", line_color="orange")
+                fig_asym.add_hline(y=52.5, line_dash="dot", line_color="red",
+                                    annotation_text="Kockázati küszöb (±2.5%)")
+                fig_asym.add_hline(y=47.5, line_dash="dot", line_color="red")
+            else:
+                fig_asym.add_hline(y=CFG["asym_warn_pct"], line_dash="dot", line_color="orange",
+                                    annotation_text=f"Figyelmeztetés ({CFG['asym_warn_pct']}%)")
+                fig_asym.add_hline(y=CFG["asym_red_pct"], line_dash="dot", line_color="red",
+                                    annotation_text=f"Kockázati küszöb ({CFG['asym_red_pct']}%)")
             st.plotly_chart(fig_asym, use_container_width=True)
 
             # --- Aszimmetria vs Fatigue kapcsolat
@@ -5220,7 +4693,7 @@ az eredmény eltérhet.
 # TAB: HŐMÉRSÉKLET-KORREKCIÓ
 # =========================================================
 with tab_heat:
-    st.subheader("🌡️ Időjárás-korrekció – hőmérséklet és szél")
+    st.subheader("🌡️ Hőmérséklet-korrekció")
     st.caption(
         "Meleg és szél együttes hatása a tempóra és HR-re. "
         "A korrigált értékek megmutatják mi lett volna az eredmény ideális körülmények között."
@@ -5232,7 +4705,6 @@ with tab_heat:
     if _owm_enabled and _has_wind:
         st.markdown("### 🌬️ Szél-korrekció (OpenWeatherMap adatok alapján)")
 
-        # Legutóbbi futás szél-összefoglaló
         _last_wind = d.dropna(subset=["wind_speed_ms"]).sort_values("Dátum").iloc[-1] \
             if _has_wind else None
 
@@ -5243,7 +4715,6 @@ with tab_heat:
                 runner_speed_ms=float(_last_wind.get("speed_mps", 3.0) or 3.0),
             )
 
-            # Státusz banner
             _wind_status_map = {
                 "calm":       ("success", "🟢"),
                 "light":      ("success", "🟢"),
@@ -5258,7 +4729,6 @@ with tab_heat:
             elif _ws_type == "error":   st.error(_ws_msg)
             else:                       st.info(_ws_msg)
 
-            # KPI kártyák
             _wk1, _wk2, _wk3, _wk4, _wk5 = st.columns(5)
             _wk1.metric("Szélsebesség",
                         f"{_wc['wind_speed_kmh']:.0f} km/h",
@@ -5283,7 +4753,6 @@ with tab_heat:
 
         st.divider()
 
-        # Szél-korrigált tempó idősor
         st.markdown("#### 📈 Futások szél-korrigált tempóval")
         st.caption(
             "Kék = tényleges tempó | Lila = szél-korrigált (szélcsendes ekvivalens). "
@@ -5311,11 +4780,10 @@ with tab_heat:
                     marker=dict(color="#9b59b6", size=6, opacity=0.8),
                     name="Szél-korrigált",
                 )
-                # Összekötő vonalak az eltérés szemléltetéséhez
                 for _, row in _wadj.iterrows():
                     if pd.notna(row["pace_sec_km"]) and pd.notna(row["pace_wind_adj_sec"]):
                         diff = abs(row["pace_sec_km"] - row["pace_wind_adj_sec"])
-                        if diff > 3:  # csak >3 sec/km különbségnél rajzoljuk
+                        if diff > 3:
                             fig_wind.add_scatter(
                                 x=[row["Dátum"], row["Dátum"]],
                                 y=[row["pace_sec_km"], row["pace_wind_adj_sec"]],
@@ -5327,7 +4795,6 @@ with tab_heat:
             fig_wind.update_yaxes(autorange="reversed")
             st.plotly_chart(fig_wind, use_container_width=True)
 
-        # Szél statisztika
         if _has_wind:
             st.markdown("#### 📊 Szél összesítő statisztika")
             _ws1, _ws2, _ws3, _ws4 = st.columns(4)
@@ -5557,629 +5024,8 @@ with tab_heat:
                         if len(_most_heat) > 0 else "—")
 
 
-# =========================================================
-# TAB: STRAVA ADATOK
-# =========================================================
-with tab_strava:
-    st.subheader("🟠 Strava adatok – részletes nézet")
-
-    if _data_source == "garmin":
-        st.info(
-            "Ez a tab Strava csatlakozás esetén aktív. "
-            "Jelenleg Garmin CSV módban fut az app – "
-            "csatlakozz Stravához a bal oldali sávban."
-        )
-    else:
-        # ── Utolsó futás nyers Strava JSON ──────────────────────────
-        st.markdown("### 🔍 Utolsó futás – nyers Strava mezők")
-        st.caption(
-            "Ez mutatja pontosan mit küld át a Strava API egy futásnál. "
-            "Látható melyik mező van meg és melyik hiányzik."
-        )
-
-        access_token = st.session_state.get("strava_access_token")
-        if access_token:
-            # Legutóbbi 1 futás letöltése részletesen
-            last_act = _strava_get(
-                "/athlete/activities",
-                access_token,
-                params={"per_page": 5, "page": 1},
-            )
-            run_acts = [a for a in (last_act or [])
-                        if a.get("sport_type", a.get("type", "")) in
-                        ("Run", "TrailRun", "VirtualRun", "Race", "Workout")]
-
-            if run_acts:
-                # Futás választó
-                options = {
-                    f"{a.get('start_date_local','')[:10]}  –  {a.get('name','?')}  "
-                    f"({a.get('distance',0)/1000:.1f} km)": a
-                    for a in run_acts
-                }
-                chosen_label = st.selectbox(
-                    "Melyik futást nézzük?",
-                    options=list(options.keys()),
-                    key="strava_debug_sel",
-                )
-                act = options[chosen_label]
-
-                # ── 1. Összefoglaló kártyák ──────────────────────────
-                st.markdown("#### 📊 Összefoglaló")
-                _c = st.columns(4)
-                _c[0].metric("Távolság", f"{act.get('distance',0)/1000:.2f} km")
-                _c[1].metric("Idő", f"{int(act.get('moving_time',0)//60)} perc")
-                hr_v = act.get("average_heartrate")
-                _c[2].metric("Átlag HR", f"{hr_v:.0f} bpm" if hr_v else "—")
-                cad_v = act.get("average_cadence")
-                _c[3].metric("Kadencia", f"{cad_v*2:.0f} spm" if cad_v else "—")
-
-                _c2 = st.columns(4)
-                spd = act.get("average_speed", 0)
-                pace_s = 1000/spd if spd > 0 else None
-                _c2[0].metric("Tempó", sec_to_pace_str(pace_s) + " /km" if pace_s else "—")
-                _c2[1].metric("Emelkedés", f"{act.get('total_elevation_gain',0):.0f} m")
-                pwr_v = act.get("average_watts")
-                _c2[2].metric("Átlag power", f"{pwr_v:.0f} W" if pwr_v else "—")
-                suf = act.get("suffer_score")
-                _c2[3].metric("Suffer score", f"{suf}" if suf else "—")
-
-                st.divider()
-
-                # ── 2. Mezők: Van / Nincs táblázat ──────────────────
-                st.markdown("#### ✅ Strava mezők – mi érkezett meg?")
-
-                STRAVA_FIELDS = {
-                    # Alapadatok
-                    "name":                     ("Cím / aktivitás neve", "alap"),
-                    "start_date_local":         ("Dátum (helyi idő)", "alap"),
-                    "distance":                 ("Távolság (m)", "alap"),
-                    "moving_time":              ("Mozgási idő (s)", "alap"),
-                    "elapsed_time":             ("Eltelt idő (s)", "alap"),
-                    "total_elevation_gain":     ("Emelkedés (m)", "alap"),
-                    "sport_type":               ("Sport típusa", "alap"),
-                    "average_speed":            ("Átlag sebesség (m/s)", "alap"),
-                    "max_speed":                ("Max sebesség (m/s)", "alap"),
-                    # Szív és erőfeszítés
-                    "average_heartrate":        ("Átlag pulzus (bpm)", "szív"),
-                    "max_heartrate":            ("Max pulzus (bpm)", "szív"),
-                    "suffer_score":             ("Suffer score", "szív"),
-                    "perceived_exertion":       ("Érzett erőfeszítés (1-10)", "szív"),
-                    # Futótechnika
-                    "average_cadence":          ("Átlag kadencia (jobb láb/perc)", "technika"),
-                    "average_watts":            ("Átlag teljesítmény (W)", "technika"),
-                    "max_watts":                ("Max teljesítmény (W)", "technika"),
-                    "weighted_average_watts":   ("Súlyozott átlag W (NP)", "technika"),
-                    "device_watts":             ("Valódi power mérő?", "technika"),
-                    # Elhelyezkedés
-                    "start_latlng":             ("Indulási koordináta", "helyszín"),
-                    "end_latlng":               ("Érkezési koordináta", "helyszín"),
-                    "map":                      ("GPS térkép (polyline)", "helyszín"),
-                    # Egyéb
-                    "average_temp":             ("Hőmérséklet (°C)", "egyéb"),
-                    "calories":                 ("Kalória", "egyéb"),
-                    "kudos_count":              ("Kudos szám", "egyéb"),
-                    "achievement_count":        ("Teljesítmények száma", "egyéb"),
-                    "pr_count":                 ("Személyes rekordok száma", "egyéb"),
-                    "gear_id":                  ("Cipő / eszköz ID", "egyéb"),
-                    "trainer":                  ("Futópad?", "egyéb"),
-                    "commute":                  ("Ingázás?", "egyéb"),
-                    # Garminban van, Stravában NINCS
-                    "vertical_oscillation":     ("⛔ Függőleges oszcilláció (VO)", "hiányzik"),
-                    "ground_contact_time":      ("⛔ Talajérintési idő (GCT)", "hiányzik"),
-                    "vertical_ratio":           ("⛔ Függőleges arány (VR)", "hiányzik"),
-                    "stride_length":            ("⛔ Lépéshossz", "hiányzik"),
-                    "left_right_balance":       ("⛔ Bal/jobb egyensúly", "hiányzik"),
-                }
-
-                rows_debug = []
-                for field, (label, category) in STRAVA_FIELDS.items():
-                    val = act.get(field)
-                    has_val = val is not None and val != "" and val != []
-
-                    if category == "hiányzik":
-                        status_icon = "❌"
-                        display_val = "Nincs Strava API-ban"
-                    elif has_val:
-                        status_icon = "✅"
-                        # Formázott érték
-                        if field == "distance":
-                            display_val = f"{float(val)/1000:.3f} km"
-                        elif field == "average_speed":
-                            pace_sec = 1000 / float(val) if float(val) > 0 else None
-                            display_val = f"{sec_to_pace_str(pace_sec)} /km ({float(val):.2f} m/s)"
-                        elif field == "moving_time" or field == "elapsed_time":
-                            m, s = divmod(int(val), 60)
-                            h, m = divmod(m, 60)
-                            display_val = f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
-                        elif field == "average_cadence":
-                            display_val = f"{float(val)*2:.0f} spm (Strava: {float(val):.1f} × 2)"
-                        elif field == "map":
-                            display_val = "✓ GPS útvonal megvan (polyline)"
-                        elif field == "start_latlng" or field == "end_latlng":
-                            display_val = f"{val[0]:.5f}, {val[1]:.5f}" if val else "—"
-                        else:
-                            display_val = str(val)
-                    else:
-                        status_icon = "⚠️"
-                        display_val = "Nincs adat (None)"
-
-                    rows_debug.append({
-                        "": status_icon,
-                        "Strava mező": field,
-                        "Magyar név": label,
-                        "Kategória": category,
-                        "Érték": display_val,
-                    })
-
-                df_debug = pd.DataFrame(rows_debug)
-
-                # Kategória szűrő
-                cats = ["összes"] + sorted(df_debug["Kategória"].unique().tolist())
-                sel_cat = st.radio(
-                    "Kategória szűrő",
-                    options=cats,
-                    horizontal=True,
-                    key="strava_cat_filter",
-                )
-                if sel_cat != "összes":
-                    df_debug = df_debug[df_debug["Kategória"] == sel_cat]
-
-                # Csak megvan / hiányzik szűrő
-                col_f1, col_f2 = st.columns(2)
-                show_missing = col_f1.checkbox("⚠️ Hiányzók megjelenítése", value=True)
-                show_garmin_only = col_f2.checkbox("❌ Garmin-only mezők", value=True)
-                if not show_missing:
-                    df_debug = df_debug[df_debug[""] != "⚠️"]
-                if not show_garmin_only:
-                    df_debug = df_debug[df_debug[""] != "❌"]
-
-                st.dataframe(
-                    df_debug,
-                    use_container_width=True,
-                    hide_index=True,
-                    height=420,
-                    column_config={
-                        "": st.column_config.TextColumn(width="small"),
-                        "Strava mező": st.column_config.TextColumn(width="medium"),
-                        "Magyar név": st.column_config.TextColumn(width="large"),
-                        "Kategória": st.column_config.TextColumn(width="small"),
-                        "Érték": st.column_config.TextColumn(width="large"),
-                    }
-                )
-
-                # ── 3. Összefoglaló számok ───────────────────────────
-                n_ok   = (df_debug[""] == "✅").sum()
-                n_warn = (df_debug[""] == "⚠️").sum()
-                n_miss = (df_debug[""] == "❌").sum()
-                st.caption(
-                    f"✅ {n_ok} mező megvan  |  "
-                    f"⚠️ {n_warn} mező hiányzik (de lekérhető lenne)  |  "
-                    f"❌ {n_miss} mező Garmin-only (Strava API-ban nincs)"
-                )
-
-                st.divider()
-
-                # ── 4. Teljes nyers JSON ─────────────────────────────
-                with st.expander("🔩 Teljes nyers Strava JSON (fejlesztői nézet)"):
-                    # Érzékeny mezők maszkolása
-                    safe_act = {k: v for k, v in act.items()
-                                if k not in ("map",)}  # polyline nem kell
-                    if "map" in act:
-                        safe_act["map"] = {"summary_polyline": "...(elrejtve)..."}
-                    st.json(safe_act)
-
-                st.divider()
-
-                # ── 5. Mit tud és mit nem a dashboard Strava módban ──
-                st.markdown("#### 📋 Dashboard képességek Strava vs Garmin módban")
-                capability_data = {
-                    "Funkció": [
-                        "ACWR / TSS / CTL / ATL / TSB",
-                        "Easy Run Target (HR + tempó)",
-                        "Easy Run Target (power)",
-                        "Ramp rate & heti terhelés",
-                        "Fatmax becslés",
-                        "Aerobic decoupling",
-                        "Recovery time modell",
-                        "Technika_index",
-                        "Fatigue_score",
-                        "RES+ (Running Economy Score)",
-                        "Aszimmetria elemzés",
-                        "Slope-aware elemzés",
-                        "Hőmérséklet-korrekció",
-                    ],
-                    "🟠 Strava": [
-                        "✅ Teljes",
-                        "✅ HR alapon",
-                        "✅ ha van power mérő",
-                        "✅ Teljes",
-                        "✅ HR + tempó alapon",
-                        "✅ HR + tempó alapon",
-                        "⚠️ Korlátozott (Fatigue hiány)",
-                        "❌ GCT/VO/VR hiányzik",
-                        "❌ GCT/VO/VR hiányzik",
-                        "⚠️ Részleges (HR/power alapon)",
-                        "❌ Bal/jobb adat hiányzik",
-                        "⚠️ Csak emelkedés alapján",
-                        "✅ ha van hőmérséklet adat",
-                    ],
-                    "📂 Garmin CSV": [
-                        "✅ Teljes",
-                        "✅ Teljes",
-                        "✅ Teljes",
-                        "✅ Teljes",
-                        "✅ Teljes",
-                        "✅ Teljes",
-                        "✅ Teljes",
-                        "✅ Teljes",
-                        "✅ Teljes",
-                        "✅ Teljes",
-                        "✅ ha Running Dynamics van",
-                        "✅ Teljes",
-                        "✅ Teljes",
-                    ],
-                    "🔀 Hibrid (mindkettő)": [
-                        "✅ Teljes",
-                        "✅ Teljes",
-                        "✅ Teljes",
-                        "✅ Teljes",
-                        "✅ Teljes",
-                        "✅ Teljes",
-                        "✅ Teljes",
-                        "✅ Teljes",
-                        "✅ Teljes",
-                        "✅ Teljes",
-                        "✅ Teljes",
-                        "✅ Teljes",
-                        "✅ Teljes",
-                    ],
-                }
-                st.dataframe(
-                    pd.DataFrame(capability_data),
-                    use_container_width=True,
-                    hide_index=True,
-                    height=490,
-                )
-
-            else:
-                st.info("Nem találtam futós aktivitást az utolsó 5 aktivitás között.")
-        else:
-            st.warning("Strava access token nem elérhető – lehet hogy lejárt a session. Frissítsd az oldalt.")
 
 
-# =========================================================
-# TAB: STRAVA ELEMZÉS
-# =========================================================
-with tab_strava_analysis:
-    st.subheader("🟠 Strava elemzés – csak Strava adatok alapján")
-    st.caption("Távolság, tempó, HR, kadencia, emelkedés, suffer score – mind a Strava API-ból.")
-
-    if _data_source == "garmin":
-        st.info("Ez az elemzés Strava csatlakozás esetén aktív. Csatlakozz Stravához a bal oldali sávban.")
-    else:
-        _s = view.copy()
-        _has_hr   = "hr_num" in _s.columns and _s["hr_num"].notna().sum() >= 3
-        _has_pace = "pace_sec_km" in _s.columns and _s["pace_sec_km"].notna().sum() >= 3
-        _has_cad  = "cad_num" in _s.columns and _s["cad_num"].notna().sum() >= 3
-        _has_pwr  = "power_avg_w" in _s.columns and _s["power_avg_w"].notna().sum() >= 3
-        _has_asc  = "asc_m" in _s.columns and _s["asc_m"].notna().sum() >= 3
-        _has_suf  = "suffer_score" in _s.columns and _s["suffer_score"].notna().sum() >= 3
-        _has_dist = "dist_km" in _s.columns and _s["dist_km"].notna().sum() >= 3
-
-        # ── 1. KPI sor ──────────────────────────────────────────
-        st.markdown("### 📊 Összesítők")
-        _k = st.columns(5)
-        _k[0].metric("Futások", f"{len(_s)}")
-        _k[1].metric("Össz távolság",
-                     f"{_s['dist_km'].sum():.0f} km" if _has_dist else "—")
-        _k[2].metric("Össz idő",
-                     f"{_s['dur_sec'].sum()/3600:.1f} h" if "dur_sec" in _s.columns else "—")
-        _k[3].metric("Átlag HR",
-                     f"{_s['hr_num'].mean():.0f} bpm" if _has_hr else "—")
-        _k[4].metric("Össz emelkedés",
-                     f"{_s['asc_m'].sum():.0f} m" if _has_asc else "—")
-
-        st.divider()
-
-        # ── 2. Tempó fejlődés ──────────────────────────────────
-        if _has_pace and _has_dist:
-            st.markdown("### 📈 Tempó fejlődés időben")
-            _sp = _s[_s["pace_sec_km"].notna() & (_s["pace_sec_km"] > 0)].copy()
-            _sp["tempó_label"] = _sp["pace_sec_km"].apply(sec_to_pace_str)
-            _sp["pace_inv"] = 1000 / _sp["pace_sec_km"]
-
-            _col1, _col2 = st.columns([3, 1])
-            with _col1:
-                _hover = {"tempó_label": True, "dist_km": ":.1f", "pace_inv": False}
-                if _has_hr and "hr_num" in _sp.columns:
-                    _hover["hr_num"] = True
-                fig_pace = px.scatter(
-                    _sp, x="Dátum", y="pace_inv",
-                    size="dist_km", size_max=18,
-                    color="hr_num" if _has_hr else None,
-                    color_continuous_scale="RdYlGn_r",
-                    hover_data=_hover,
-                    labels={"pace_inv": "Sebesség (km/h)", "dist_km": "Táv (km)", "hr_num": "HR"},
-                    title="Sebesség időben  (méretarány = távolság, szín = HR)",
-                )
-                if len(_sp) >= 8:
-                    _sp2 = _sp.sort_values("Dátum").copy()
-                    _sp2["roll"] = _sp2["pace_inv"].rolling(8, min_periods=4).mean()
-                    for tr in px.line(_sp2, x="Dátum", y="roll",
-                                      color_discrete_sequence=["#1a73e8"]).data:
-                        tr.name = "8 futós átlag"; tr.showlegend = True
-                        fig_pace.add_trace(tr)
-                fig_pace.update_yaxes(tickformat=".2f")
-                st.plotly_chart(fig_pace, use_container_width=True)
-            with _col2:
-                st.markdown("**Tempó statisztika**")
-                for lbl, val in [
-                    ("Leggyorsabb", sec_to_pace_str(_sp["pace_sec_km"].min())),
-                    ("Leglassabb",  sec_to_pace_str(_sp["pace_sec_km"].max())),
-                    ("Medián",      sec_to_pace_str(float(_sp["pace_sec_km"].median()))),
-                    ("Utolsó 5 átl.", sec_to_pace_str(float(_sp.tail(5)["pace_sec_km"].mean()))),
-                ]:
-                    st.metric(lbl, val + " /km")
-
-            st.divider()
-
-        # ── 3. HR–Tempó – aerob hatékonyság ────────────────────
-        if _has_hr and _has_pace:
-            st.markdown("### ❤️ HR vs Tempó – aerob hatékonyság")
-            st.caption("Minél lejjebb-jobbra egy pont, annál jobb: gyorsabb tempó alacsonyabb HR-rel.")
-            _ht = _s[_s["hr_num"].notna() & _s["pace_sec_km"].notna() &
-                     (_s["pace_sec_km"] > 0)].copy()
-            _ht["pace_inv"] = 1000 / _ht["pace_sec_km"]
-            hr_med = float(_ht["hr_num"].median())
-            _ht["hr_zone"] = pd.cut(
-                _ht["hr_num"],
-                bins=[0, hr_med*0.80, hr_med*0.90, hr_med*1.0, hr_med*1.08, 999],
-                labels=["Z1 Nagyon könnyű", "Z2 Könnyű", "Z3 Aerob", "Z4 Küszöb", "Z5 Intenzív"],
-            )
-            fig_ht = px.scatter(
-                _ht, x="hr_num", y="pace_inv",
-                color="hr_zone",
-                size="dist_km" if _has_dist else None, size_max=16,
-                hover_data={"Dátum": "|%Y-%m-%d", "dist_km": ":.1f"},
-                labels={"hr_num": "Átlag HR (bpm)", "pace_inv": "Sebesség (km/h)", "hr_zone": "Zóna"},
-                color_discrete_sequence=px.colors.qualitative.Safe,
-                title="HR vs Sebesség (zóna szerint színezve)",
-            )
-            _x_ht = _ht["hr_num"].to_numpy(dtype=float)
-            _y_ht = _ht["pace_inv"].to_numpy(dtype=float)
-            _mk = np.isfinite(_x_ht) & np.isfinite(_y_ht)
-            if _mk.sum() >= 5:
-                _cf = np.polyfit(_x_ht[_mk], _y_ht[_mk], 1)
-                _xl = np.linspace(_x_ht[_mk].min(), _x_ht[_mk].max(), 50)
-                fig_ht.add_scatter(x=_xl, y=np.polyval(_cf, _xl), mode="lines",
-                                   name="Trend", line=dict(color="gray", dash="dash", width=1.5))
-            st.plotly_chart(fig_ht, use_container_width=True)
-
-            _ht["aei"] = _ht["pace_inv"] / _ht["hr_num"] * 100
-            _n3 = max(1, len(_ht)//3)
-            _aei_first = float(_ht.head(_n3)["aei"].mean())
-            _aei_last  = float(_ht.tail(_n3)["aei"].mean())
-            _aei_delta = _aei_last - _aei_first
-            _ac1, _ac2, _ac3 = st.columns(3)
-            _ac1.metric("AEI – első harmad",  f"{_aei_first:.2f}")
-            _ac2.metric("AEI – utolsó harmad", f"{_aei_last:.2f}", delta=f"{_aei_delta:+.2f}")
-            _ac3.metric("Trend",
-                        "📈 Javuló" if _aei_delta > 0.05 else
-                        "📉 Romló"  if _aei_delta < -0.05 else "➡️ Stabil")
-
-            st.divider()
-
-        # ── 4. Heti volumen & ramp rate ────────────────────────
-        if _has_dist:
-            st.markdown("### 📅 Heti volumen & ramp rate")
-            _sw = _s.copy()
-            _sw["hét"] = _sw["Dátum"].dt.to_period("W").dt.start_time
-            _weekly = _sw.groupby("hét").agg(
-                km=("dist_km", "sum"),
-                futások=("dist_km", "count"),
-                hr_avg=("hr_num", "mean"),
-                asc=("asc_m", "sum"),
-            ).reset_index()
-            _weekly["prev_km"] = _weekly["km"].shift(1)
-            _weekly["ramp"] = ((_weekly["km"] - _weekly["prev_km"])
-                               / _weekly["prev_km"].replace(0, np.nan) * 100)
-
-            _wc1, _wc2 = st.columns(2)
-            with _wc1:
-                fig_wk = px.bar(_weekly, x="hét", y="km",
-                                color="hr_avg" if _has_hr else None,
-                                color_continuous_scale="RdYlGn_r",
-                                labels={"km": "Heti km", "hét": "", "hr_avg": "Átlag HR"},
-                                title="Heti futott kilométerek")
-                st.plotly_chart(fig_wk, use_container_width=True)
-            with _wc2:
-                _ramp_df = _weekly.dropna(subset=["ramp"]).copy()
-                if len(_ramp_df) >= 3:
-                    _ramp_df["szín"] = _ramp_df["ramp"].apply(
-                        lambda r: "piros" if r > CFG["ramp_red"]
-                        else "sárga" if r > CFG["ramp_warn"] else "zöld"
-                    )
-                    fig_ramp = px.bar(_ramp_df, x="hét", y="ramp", color="szín",
-                                      color_discrete_map={"piros": "#e74c3c",
-                                                          "sárga": "#f39c12", "zöld": "#2ecc71"},
-                                      title="Heti ramp rate (%)",
-                                      labels={"ramp": "Ramp (%)", "hét": ""})
-                    fig_ramp.add_hline(y=CFG["ramp_warn"], line_dash="dot",
-                                       line_color="orange", annotation_text="Figyelj (8%)")
-                    fig_ramp.add_hline(y=CFG["ramp_red"], line_dash="dot",
-                                       line_color="red", annotation_text="Veszélyes (12%)")
-                    st.plotly_chart(fig_ramp, use_container_width=True)
-                else:
-                    st.info("Ramp rate-hez legalább 4 hét adat kell.")
-
-            st.divider()
-
-        # ── 5. Kadencia ────────────────────────────────────────
-        if _has_cad:
-            st.markdown("### 🦵 Kadencia elemzés")
-            _sc = _s[_s["cad_num"].notna() & (_s["cad_num"] > 100)].copy()
-            _cc1, _cc2 = st.columns(2)
-            with _cc1:
-                fig_cad = px.scatter(
-                    _sc, x="Dátum", y="cad_num",
-                    color="hr_num" if _has_hr else None,
-                    color_continuous_scale="RdYlGn_r",
-                    title="Kadencia időben",
-                    labels={"cad_num": "Kadencia (spm)", "hr_num": "HR"},
-                )
-                fig_cad.add_hline(y=170, line_dash="dot", line_color="orange",
-                                  annotation_text="170 spm ajánlott alsó")
-                fig_cad.add_hline(y=180, line_dash="dot", line_color="green",
-                                  annotation_text="180 spm optimum")
-                if len(_sc) >= 8:
-                    _sc2 = _sc.sort_values("Dátum").copy()
-                    _sc2["roll"] = _sc2["cad_num"].rolling(8, min_periods=4).mean()
-                    for tr in px.line(_sc2, x="Dátum", y="roll",
-                                      color_discrete_sequence=["#1a73e8"]).data:
-                        tr.name = "8 futós átlag"; fig_cad.add_trace(tr)
-                st.plotly_chart(fig_cad, use_container_width=True)
-            with _cc2:
-                fig_cad_hist = px.histogram(_sc, x="cad_num", nbins=20,
-                                            title="Kadencia eloszlás",
-                                            labels={"cad_num": "Kadencia (spm)"},
-                                            color_discrete_sequence=["#3498db"])
-                fig_cad_hist.add_vline(x=180, line_dash="dash", line_color="green",
-                                       annotation_text="180 spm")
-                st.plotly_chart(fig_cad_hist, use_container_width=True)
-            _cad_ok = (_sc["cad_num"] >= 170).mean() * 100
-            _cdc1, _cdc2, _cdc3 = st.columns(3)
-            _cdc1.metric("Átlag kadencia",   f"{_sc['cad_num'].mean():.0f} spm")
-            _cdc2.metric("Medián kadencia",  f"{_sc['cad_num'].median():.0f} spm")
-            _cdc3.metric("Futások 170+ spm", f"{_cad_ok:.0f}%")
-            st.divider()
-
-        # ── 6. Emelkedés ───────────────────────────────────────
-        if _has_asc and _has_dist:
-            st.markdown("### ⛰️ Emelkedés és terep")
-            _sa = _s[_s["dist_km"].notna() & (_s["dist_km"] > 0)].copy()
-            _sa["emelkedés/km"] = _sa["asc_m"] / _sa["dist_km"]
-            _asc1, _asc2 = st.columns(2)
-            with _asc1:
-                fig_asc = px.scatter(
-                    _sa, x="dist_km", y="asc_m",
-                    color="pace_sec_km" if _has_pace else None,
-                    color_continuous_scale="RdYlGn",
-                    size="dur_sec" if "dur_sec" in _sa.columns else None, size_max=18,
-                    hover_data={"Dátum": "|%Y-%m-%d", "emelkedés/km": ":.1f"},
-                    title="Emelkedés vs távolság",
-                    labels={"dist_km": "Távolság (km)", "asc_m": "Emelkedés (m)"},
-                )
-                st.plotly_chart(fig_asc, use_container_width=True)
-            with _asc2:
-                if "slope_bucket" in _sa.columns:
-                    _terep = _sa["slope_bucket"].apply(slope_bucket_hu).value_counts().reset_index()
-                    _terep.columns = ["Terep", "Futások"]
-                    fig_terep = px.pie(_terep, values="Futások", names="Terep",
-                                       title="Terep megoszlás",
-                                       color_discrete_sequence=px.colors.qualitative.Safe)
-                    st.plotly_chart(fig_terep, use_container_width=True)
-            st.divider()
-
-        # ── 7. Suffer Score ────────────────────────────────────
-        if _has_suf:
-            st.markdown("### 😤 Suffer Score – edzésterhelés")
-            _ss = _s[_s["suffer_score"].notna() & (_s["suffer_score"] > 0)].copy()
-            _sfc1, _sfc2 = st.columns(2)
-            with _sfc1:
-                fig_suf = px.bar(_ss.sort_values("Dátum"), x="Dátum", y="suffer_score",
-                                 color="suffer_score", color_continuous_scale="RdYlGn_r",
-                                 title="Suffer Score futásonként",
-                                 labels={"suffer_score": "Suffer Score"})
-                if len(_ss) >= 6:
-                    _ss2 = _ss.sort_values("Dátum").copy()
-                    _ss2["roll"] = _ss2["suffer_score"].rolling(6, min_periods=3).mean()
-                    for tr in px.line(_ss2, x="Dátum", y="roll",
-                                      color_discrete_sequence=["#2c3e50"]).data:
-                        tr.name = "6 futós átlag"; fig_suf.add_trace(tr)
-                st.plotly_chart(fig_suf, use_container_width=True)
-            with _sfc2:
-                if _has_hr:
-                    fig_suf_hr = px.scatter(
-                        _ss, x="hr_num", y="suffer_score",
-                        size="dist_km" if _has_dist else None, size_max=16,
-                        color="pace_sec_km" if _has_pace else None,
-                        color_continuous_scale="RdYlGn",
-                        title="HR vs Suffer Score",
-                        labels={"hr_num": "Átlag HR (bpm)", "suffer_score": "Suffer Score"},
-                    )
-                    _x_sf = _ss["hr_num"].to_numpy(dtype=float)
-                    _y_sf = _ss["suffer_score"].to_numpy(dtype=float)
-                    _mf = np.isfinite(_x_sf) & np.isfinite(_y_sf)
-                    if _mf.sum() >= 5:
-                        _cf2 = np.polyfit(_x_sf[_mf], _y_sf[_mf], 1)
-                        _xl2 = np.linspace(_x_sf[_mf].min(), _x_sf[_mf].max(), 50)
-                        fig_suf_hr.add_scatter(x=_xl2, y=np.polyval(_cf2, _xl2),
-                                               mode="lines", name="Trend",
-                                               line=dict(color="gray", dash="dash"))
-                    st.plotly_chart(fig_suf_hr, use_container_width=True)
-                else:
-                    fig_suf_hist = px.histogram(_ss, x="suffer_score", nbins=15,
-                                                title="Suffer Score eloszlás",
-                                                color_discrete_sequence=["#e74c3c"])
-                    st.plotly_chart(fig_suf_hist, use_container_width=True)
-            _sk1, _sk2, _sk3, _sk4 = st.columns(4)
-            _sk1.metric("Átlag",  f"{_ss['suffer_score'].mean():.0f}")
-            _sk2.metric("Max",    f"{_ss['suffer_score'].max():.0f}")
-            _sk3.metric("Össz",   f"{_ss['suffer_score'].sum():.0f}")
-            _sk4.metric("Intenzív (>50)", f"{(_ss['suffer_score'] > 50).sum()}")
-            st.divider()
-
-        # ── 8. Power (Stryd) ───────────────────────────────────
-        if _has_pwr:
-            st.markdown("### ⚡ Power – futás-gazdaságosság (Stryd)")
-            _sp_p = _s[_s["power_avg_w"].notna() & (_s["power_avg_w"] > 0)].copy()
-            _pw1, _pw2 = st.columns(2)
-            with _pw1:
-                fig_pwr = px.scatter(
-                    _sp_p, x="Dátum", y="power_avg_w",
-                    size="dist_km" if _has_dist else None, size_max=18,
-                    color="hr_num" if _has_hr else None,
-                    color_continuous_scale="RdYlGn_r",
-                    title="Átlag power időben",
-                    labels={"power_avg_w": "Power (W)", "hr_num": "HR"},
-                )
-                if len(_sp_p) >= 8:
-                    _sp_p2 = _sp_p.sort_values("Dátum").copy()
-                    _sp_p2["roll"] = _sp_p2["power_avg_w"].rolling(8, min_periods=4).mean()
-                    for tr in px.line(_sp_p2, x="Dátum", y="roll",
-                                      color_discrete_sequence=["#8e44ad"]).data:
-                        tr.name = "8 futós átlag"; fig_pwr.add_trace(tr)
-                st.plotly_chart(fig_pwr, use_container_width=True)
-            with _pw2:
-                if _has_hr:
-                    _sp_p["pw_hr"] = _sp_p["power_avg_w"] / _sp_p["hr_num"]
-                    fig_pwhr = px.scatter(
-                        _sp_p, x="Dátum", y="pw_hr",
-                        title="Power/HR arány (futás-gazdaságosság proxy)",
-                        labels={"pw_hr": "W/bpm"},
-                        color_discrete_sequence=["#27ae60"],
-                    )
-                    if len(_sp_p) >= 8:
-                        _sp_p["roll_r"] = _sp_p["pw_hr"].rolling(8, min_periods=4).mean()
-                        for tr in px.line(_sp_p, x="Dátum", y="roll_r",
-                                          color_discrete_sequence=["#2c3e50"]).data:
-                            tr.name = "Trend"; fig_pwhr.add_trace(tr)
-                    st.plotly_chart(fig_pwhr, use_container_width=True)
-
-        # ── 9. Hiányzó adatok figyelmeztetése ──────────────────
-        _miss = [n for n, h in [("Pulzus (HR)", _has_hr), ("Kadencia", _has_cad),
-                                 ("Power (Stryd)", _has_pwr), ("Suffer Score", _has_suf)]
-                 if not h]
-        if _miss:
-            st.info(
-                f"⚠️ Hiányzó adatok ebben az időszakban: **{', '.join(_miss)}**. "
-                f"Pulzusmérő és Stryd eszközök bővítik az elemzést."
-            )
-
-
-# =========================================================
-# TAB: ADATOK
-# =========================================================
 # =========================================================
 # TAB: 🤖 AI EDZŐ
 # =========================================================
@@ -6187,6 +5033,7 @@ with tab_ai:
     st.subheader("🤖 AI Edző – személyre szabott elemzés")
     st.caption("Claude AI összefoglalja az edzésadataidat és személyre szabott javaslatokat ad.")
 
+    # API kulcs ellenőrzés
     ai_api_key = st.secrets.get("ANTHROPIC_API_KEY", None)
     if not ai_api_key:
         st.error(
@@ -6195,6 +5042,7 @@ with tab_ai:
             "```toml\nANTHROPIC_API_KEY = \"sk-ant-...\"\n```"
         )
     else:
+        # --- Kontextus összerakása az adatokból
         last_runs = d.dropna(subset=["Dátum"]).sort_values("Dátum").tail(10)
         recent = d[d["Dátum"] >= (d["Dátum"].max() - pd.Timedelta(weeks=4))]
 
@@ -6203,18 +5051,23 @@ with tab_ai:
             lines.append(f"Futó adatai: {user_age} éves, {weight_kg} kg, {height_cm} cm, HRmax: {hrmax} bpm")
             lines.append(f"Adatforrás: {_data_source}")
             lines.append(f"Összes futás (szűrt időszak): {len(view)}")
+
             if "dist_km" in recent.columns and recent["dist_km"].notna().any():
                 lines.append(f"Utolsó 4 hét össztáv: {recent['dist_km'].sum():.1f} km")
                 lines.append(f"Utolsó 4 hét futások száma: {len(recent)}")
+
             if "dur_sec" in recent.columns and recent["dur_sec"].notna().any():
                 lines.append(f"Utolsó 4 hét összes edzésidő: {recent['dur_sec'].sum()/3600:.1f} óra")
+
             if "Technika_index" in d.columns and d["Technika_index"].notna().any():
                 ti = d["Technika_index"].dropna()
                 ti_trend = ti.tail(5).mean() - ti.tail(15).head(10).mean() if len(ti) >= 15 else 0
                 lines.append(f"Technika_index – összes átlag: {ti.mean():.1f}, utolsó 5 futás átlag: {ti.tail(5).mean():.1f}, trend: {ti_trend:+.1f}")
+
             if fatigue_col and d[fatigue_col].notna().any():
                 fv = d[fatigue_col].dropna()
                 lines.append(f"Fatigue_score – aktuális: {fv.iloc[-1]:.1f}, 4 hetes átlag: {fv.tail(20).mean():.1f}, max az utóbbi időben: {fv.tail(20).max():.1f}")
+
             if "TSS_proxy" in d.columns and d["TSS_proxy"].notna().any():
                 try:
                     _acwr_ctx = compute_acwr(d, load_col="TSS_proxy")
@@ -6222,32 +5075,37 @@ with tab_ai:
                         _pmc_ctx = compute_ctl_atl_tsb(_acwr_ctx)
                         if not _pmc_ctx.empty:
                             lp = _pmc_ctx.iloc[-1]
-                            lines.append(f"PMC – CTL: {lp.get('CTL','?'):.1f}, ATL: {lp.get('ATL','?'):.1f}, TSB: {lp.get('TSB','?'):+.1f} ({lp.get('TSB_status','?')})")
-                            if 'acwr' in lp and pd.notna(lp.get('acwr')):
-                                lines.append(f"ACWR: {lp.get('acwr','?'):.2f} ({lp.get('acwr_status','?')})")
+                            lines.append(f"PMC – CTL (fittség): {lp.get('CTL', '?'):.1f}, ATL (fáradtság): {lp.get('ATL', '?'):.1f}, TSB (forma): {lp.get('TSB', '?'):+.1f} ({lp.get('TSB_status', '?')})")
+                            lines.append(f"ACWR: {lp.get('acwr', '?'):.2f} ({lp.get('acwr_status', '?')})" if 'acwr' in lp and pd.notna(lp.get('acwr')) else "ACWR: nincs adat")
                 except Exception:
                     pass
+
             if run_type_col and run_type_col in d.columns:
                 type_dist = d.groupby(run_type_col)["dist_km"].agg(["sum", "count"]).round(1)
                 for rt, row in type_dist.iterrows():
                     lines.append(f"Edzés típus – {run_type_hu(rt)}: {row['count']:.0f} futás, {row['sum']:.0f} km összesen")
+
             if "Asymmetry_score" in d.columns and d["Asymmetry_score"].notna().any():
                 asym_last = float(d.dropna(subset=["Asymmetry_score"]).sort_values("Dátum").iloc[-1]["Asymmetry_score"])
                 lines.append(f"Aszimmetria score (utolsó futás): {asym_last:.1f}%")
+
+            # Utolsó 5 futás részletei
             lines.append("\n--- UTOLSÓ 5 FUTÁS ---")
             for _, row in last_runs.tail(5).iterrows():
                 r_type = run_type_hu(row.get("Run_type", "")) or "—"
-                r_dist = f"{row.get('dist_km','?'):.1f} km" if pd.notna(row.get("dist_km")) else "?"
+                r_dist = f"{row.get('dist_km', '?'):.1f} km" if pd.notna(row.get("dist_km")) else "?"
                 r_pace = sec_to_pace_str(row.get("pace_sec_km")) + "/km" if pd.notna(row.get("pace_sec_km")) else "?"
-                r_hr   = f"{row.get('hr_num','?'):.0f} bpm" if pd.notna(row.get("hr_num")) else "?"
-                r_tech = f"Tech:{row.get('Technika_index','?'):.0f}" if pd.notna(row.get("Technika_index")) else ""
-                r_fat  = f"Fat:{row.get(fatigue_col,'?'):.0f}" if (fatigue_col and pd.notna(row.get(fatigue_col))) else ""
-                r_elev = f"↑{row.get('asc_m',0):.0f}m" if pd.notna(row.get("asc_m")) and row.get("asc_m", 0) > 0 else ""
+                r_hr   = f"{row.get('hr_num', '?'):.0f} bpm" if pd.notna(row.get("hr_num")) else "?"
+                r_tech = f"Tech:{row.get('Technika_index', '?'):.0f}" if pd.notna(row.get("Technika_index")) else ""
+                r_fat  = f"Fat:{row.get(fatigue_col, '?'):.0f}" if (fatigue_col and pd.notna(row.get(fatigue_col))) else ""
+                r_elev = f"↑{row.get('asc_m', 0):.0f}m" if pd.notna(row.get("asc_m")) and row.get("asc_m", 0) > 0 else ""
                 lines.append(f"  {row['Dátum'].strftime('%Y-%m-%d')} | {r_type} | {r_dist} | {r_pace} | HR:{r_hr} | {r_tech} {r_fat} {r_elev}".strip())
+
             return "\n".join(lines)
 
         ctx = build_ai_context()
 
+        # --- Kérdés típus választó
         st.markdown("### 💬 Mit szeretnél megtudni?")
         ai_mode = st.radio(
             "Válassz kérdéstípust:",
@@ -6266,11 +5124,12 @@ with tab_ai:
         if ai_mode == "❓ Saját kérdés":
             user_question = st.text_area(
                 "Írd be a kérdésedet:",
-                placeholder="Pl. Mikor legyek készen egy félmaratonra? Miért romlik a technikám?",
+                placeholder="Pl. Mikor legyek készen egy félmaratonra? Miért romlik a technikám? Mit javítsak először?",
                 key="ai_custom_q",
                 height=100,
             )
 
+        # --- Generálás gomb
         col_btn, col_tip = st.columns([1, 3])
         with col_btn:
             generate_clicked = st.button("🚀 AI elemzés", type="primary", key="ai_generate", use_container_width=True)
@@ -6281,25 +5140,34 @@ with tab_ai:
             prompts = {
                 "📊 Átfogó elemzés és értékelés": (
                     "Kérlek elemezd az alábbi futó edzésadatait részletesen! "
-                    "Adj átfogó értékelést: terhelés trendje, technika állapota, fáradtság szintje, forma. "
+                    "Adj átfogó értékelést: terhelés trendje, technika állapota, fáradtság szintje, forma (TSB/CTL/ATL). "
                     "Emeld ki a 3 legfontosabb erősséget és a 3 legfontosabb fejlesztendő területet. "
                     "Adj konkrét, cselekvésre ösztönző javaslatokat. Magyarul válaszolj."
                 ),
                 "📅 Holnapi edzésjavaslat": (
                     "Az alábbi edzésadatok alapján adj konkrét javaslatot a HOLNAPI edzésre! "
-                    "Írd le: milyen típusú legyen, mekkora táv, milyen tempó/HR tartomány, mennyi idő. "
-                    "Indokold meg az aktuális fáradtság, forma és technika alapján. Magyarul válaszolj."
+                    "Írd le: milyen típusú legyen (easy/tempo/interval/pihenő), mekkora táv, milyen tempó/HR tartomány, mennyi idő. "
+                    "Indokold meg röviden az aktuális fáradtság, forma és technika alapján. "
+                    "Ha pihenőnap javasolt, magyarázd el miért. Magyarul válaszolj."
                 ),
                 "📈 Fejlődési trend és javaslatok": (
-                    "Elemezd a futó fejlődési trendjét! Van-e javulás a technikában, futás-gazdaságosságban, formában? "
+                    "Elemezd a futó fejlődési trendjét az adatok alapján! "
+                    "Van-e javulás a technikában (Technika_index), futás-gazdaságosságban (RES+), formában (TSB)? "
+                    "Azonosítsd a hosszú távú mintákat: mikor volt a csúcspont, mi okoz ingadozást. "
                     "Adj 3 konkrét, személyre szabott javaslatot a következő 4-6 hétre. Magyarul válaszolj."
                 ),
                 "🏃 Utolsó futás részletes elemzése": (
-                    "Elemezd részletesen az UTOLSÓ FUTÁST! Értékeld a tempót, HR-t, technikát és fáradtságot. "
-                    "Hasonlítsd össze az előző 4 futással. Adj konkrét visszajelzést és javaslatot a következő edzésre. "
+                    "Az alábbi edzésadatok alapján elemezd részletesen az UTOLSÓ FUTÁST! "
+                    "Értékeld: a tempót és a HR-t (volt-e hatékony az erőkifejtés?), "
+                    "a technikát (Technika_index – javult vagy romlott az előző futásokhoz képest?), "
+                    "a fáradtsági szintet (Fatigue_score – mennyire terhelte meg a szervezetet?), "
+                    "és a futás-gazdaságosságot (RES+ ha elérhető). "
+                    "Hasonlítsd össze az előző 4 futással: mi változott, mi a tendencia? "
+                    "Adj konkrét visszajelzést: mi sikerült jól, min kell dolgozni, és mit javasolsz a következő edzésre. "
                     "Magyarul válaszolj."
                 ),
             }
+
             if ai_mode == "❓ Saját kérdés":
                 if not user_question or not user_question.strip():
                     st.warning("Írd be a kérdésedet!")
@@ -6322,31 +5190,40 @@ with tab_ai:
                             "Futásbiomechanikai adatokat, terhelésmenedzsmentet (CTL/ATL/TSB/ACWR) "
                             "és teljesítményindexeket (Technika_index, Fatigue_score, RES+) értesz. "
                             "Mindig konkrét, személyre szabott tanácsokat adsz tudományos alapon. "
-                            "Tömör de informatív válaszokat adsz magyarul."
+                            "Magyarázod a döntések logikáját. Tömör de informatív válaszokat adsz. "
+                            "Pozitív, motiváló hangvételű vagy, de őszintén mutatod a kockázatokat is."
                         ),
                         messages=[{"role": "user", "content": full_prompt}],
                     )
                     ai_response = _resp.content[0].text
+
                     st.markdown("---")
                     st.markdown("### 🤖 AI Edző válasza")
                     st.markdown(ai_response)
                     if _resp.stop_reason == "max_tokens":
-                        st.warning("⚠️ A válasz csonkult – próbálj rövidebb kérdést.")
+                        st.warning("⚠️ A válasz még így is csonkult. Próbálj konkrétabb / rövidebb kérdést feltenni.")
+
+                    # Mentés session-be
                     st.session_state["last_ai_response"] = ai_response
                     st.session_state["last_ai_mode"] = ai_mode
+                    st.session_state["last_ai_ctx"] = ctx
+
                 except Exception as e:
                     st.error(f"❌ API hiba: {e}\n\nEllenőrizd az ANTHROPIC_API_KEY secret értékét.")
 
         elif "last_ai_response" in st.session_state:
             st.markdown("---")
             st.markdown(f"### 🤖 Előző elemzés")
-            st.caption(f"Típus: {st.session_state.get('last_ai_mode','?')} | Kattints a gombra az újrageneráláshoz.")
+            st.caption(f"Kérdéstípus: {st.session_state.get('last_ai_mode', '?')} | Az adatok frissülhettek azóta – kattints a gombra az újrageneráláshoz.")
             st.markdown(st.session_state["last_ai_response"])
 
+        # Adatkontextus megtekintése
         with st.expander("🔍 Milyen adatokat lát az AI?"):
             st.code(ctx, language="text")
 
-
+# =========================================================
+# TAB: ADATOK
+# =========================================================
 with tab_data:
     st.subheader("📄 Adatok (szűrve)")
     st.caption("A szűrt futások teljes adattáblája. Az elemzésekhez elég az első 4 tab.")
